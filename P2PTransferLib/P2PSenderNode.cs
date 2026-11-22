@@ -11,50 +11,48 @@ using System.Threading.Tasks;
 namespace P2PTransferLib
 {
     /// <summary>
-    /// P2P 송신자(A) 측 순수 P2P 파일 전송 엔진 클래스 (채팅 통신 분리됨)
-    /// - P2P 전송 전용 TCP 포트 리스닝 및 세션 관리
-    /// - 수신자가 요청한 패킷 번호(ChunkIndex)와 일정한 패킷 크기(ChunkSize)를 기반으로 전송 진행률 자동 계산
-    /// - 헤더의 P2PCommand로 데이터 패킷(DataChunk)과 제어 명령(RequestChunk, Pause, Resume, Cancel, WaitQueue 등) 구분 처리
-    /// - 동시 수신자 최대 수 제한 (예: 3명 전송 중이면 E, F는 WaitingQueue 상태)
-    /// - 전송 속도 제한(KB/s) 실시간 반영
-    /// - 파일 조각(Chunk) 암호화 및 SHA-256 무결성 해시 제공
+    /// P2P 송신자(서버) 모듈
+    /// - 프로그램 내에 글로벌 변수 하나(또는 P2PSenderNode.Instance 싱글톤)만 두고 사용합니다.
+    /// - chID(채널ID) + msgID(파일ID) 조합으로 파일을 등록하고, 수신자가 (peerID, peerName, chID, msgID)로 요청하면 백그라운드로 동시 전송합니다.
+    /// - GetRegisteredFiles() 및 GetSenderTransferList()를 통해 등록된 송신 파일 목록, 각 수신자별 전송 상태, 남은 유효시간(30분)을 언제든 조회할 수 있습니다.
     /// </summary>
     public class P2PSenderNode : IDisposable
     {
-        public string NodeId { get; } = "SENDER_A";
-        public string NodeName { get; set; } = "Sender(A)";
-        public int P2PTransferPort { get; private set; }
-        public bool IsRunning => _isP2PServerRunning;
+        /// <summary>
+        /// 어디서든 하나로 접근 가능한 글로벌 싱글톤 인스턴스
+        /// </summary>
+        public static P2PSenderNode Instance { get; } = new P2PSenderNode();
+
+        public int Port { get; private set; }
+        public bool IsRunning => _isRunning;
 
         /// <summary>
-        /// 고정 파일 조각 크기 (기본 64 KB).
-        /// 64KB로 설정하여 제어 명령(Pause/Cancel 등)의 응답 지연을 최소화하고 패킷 번호만으로 진행 상태를 산출합니다.
+        /// 고정 패킷(조각) 크기: 기본 64KB
         /// </summary>
-        public int DefaultChunkSize { get; set; } = 64 * 1024;
+        public int ChunkSize { get; set; } = 64 * 1024;
 
         /// <summary>
-        /// 파일 전송 유효 시간 (기본 30분)
+        /// 등록된 파일의 유효 시간 (기본 30분)
         /// </summary>
-        public TimeSpan OfferValidDuration { get; set; } = TimeSpan.FromMinutes(30);
+        public TimeSpan ValidDuration { get; set; } = TimeSpan.FromMinutes(30);
 
         private int _maxConcurrentReceivers = 3;
         /// <summary>
-        /// 동시에 파일을 수신할 수 있는 최대 클라이언트 수 (기본 3명)
+        /// 최대 동시 전송 수 (기본 3). 초과하는 요청은 자동으로 대기(WaitQueue) 후 순차 전송됨.
         /// </summary>
         public int MaxConcurrentReceivers
         {
             get => _maxConcurrentReceivers;
             set
             {
-                if (value < 1) value = 1;
-                _maxConcurrentReceivers = value;
-                ProcessWaitingReceiversQueue();
+                _maxConcurrentReceivers = Math.Max(1, value);
+                ProcessWaitingQueue();
             }
         }
 
         private int _speedLimitKbps = 0;
         /// <summary>
-        /// 전송 속도 제한 (KB/s). 0 이하이면 무제한.
+        /// 전송 속도 제한 (KB/s). 0이면 무제한.
         /// </summary>
         public int SpeedLimitKbps
         {
@@ -62,446 +60,52 @@ namespace P2PTransferLib
             set => _speedLimitKbps = Math.Max(0, value);
         }
 
-        private TcpListener _p2pListener;
+        private TcpListener _listener;
         private CancellationTokenSource _cts;
-        private bool _isP2PServerRunning;
+        private bool _isRunning;
 
-        // 등록된 파일 전송 묶음 목록 (Key: TransferId)
-        private readonly ConcurrentDictionary<string, TransferOffer> _offers = new ConcurrentDictionary<string, TransferOffer>();
+        // 등록된 송신 파일 목록 (Key: "{chId}_{msgId}")
+        private readonly ConcurrentDictionary<string, RegisteredFileItem> _registeredFiles = new ConcurrentDictionary<string, RegisteredFileItem>();
 
-        // 취소/일시정지 상태 추적 (Key: "{TransferId}_{PeerId}" 또는 "{TransferId}")
-        private readonly ConcurrentDictionary<string, bool> _cancelledKeys = new ConcurrentDictionary<string, bool>();
-        private readonly ConcurrentDictionary<string, bool> _pausedKeys = new ConcurrentDictionary<string, bool>();
+        // 수신자별 송신 상태 기록 목록 (Key: "{chId}_{msgId}_{peerId}")
+        private readonly ConcurrentDictionary<string, SenderTransferStatusItem> _transferStatusMap = new ConcurrentDictionary<string, SenderTransferStatusItem>();
 
-        // 활성 P2P 세션 추적 (Key: "{TransferId}_{PeerId}")
-        private readonly ConcurrentDictionary<string, ActivePeerSession> _activeSessions = new ConcurrentDictionary<string, ActivePeerSession>();
+        // 현재 연결되어 전송 중인 활성 소켓 세션 목록 (Key: SessionKey)
+        private readonly ConcurrentDictionary<string, ClientSession> _activeSessions = new ConcurrentDictionary<string, ClientSession>();
 
-        // 동시 수신 제한 슬롯 관리 (PeerId 단위)
-        private readonly object _slotLock = new object();
-        private readonly HashSet<string> _activeUploadingPeers = new HashSet<string>();
-        private readonly Queue<WaitingPeerSlot> _waitingPeersQueue = new Queue<WaitingPeerSlot>();
+        // 동시 전송 제한 슬롯 및 대기열 관리
+        private readonly object _queueLock = new object();
+        private int _activeTransferCount = 0;
+        private readonly Queue<TaskCompletionSource<bool>> _waitingQueue = new Queue<TaskCompletionSource<bool>>();
 
-        public event EventHandler<TransferProgressEventArgs> TransferProgressUpdated;
+        /// <summary>
+        /// 단순 로그 출력 이벤트
+        /// </summary>
+        public event Action<string> OnLog;
 
-        private class ActivePeerSession
+        /// <summary>
+        /// 진행 상태 이벤트 (WaitingQueue, Transferring, Paused, Completed, Cancelled, Expired, Error 모두 전달됨)
+        /// </summary>
+        public event EventHandler<TransferProgressEventArgs> OnProgress;
+
+        private class ClientSession
         {
-            public string TransferId { get; set; }
-            public string FileId { get; set; }
+            public string SessionKey { get; set; }
             public string PeerId { get; set; }
             public string PeerName { get; set; }
+            public string ChId { get; set; }
+            public string MsgId { get; set; }
+            public RegisteredFileItem FileItem { get; set; }
+            public int LastChunkIndex { get; set; }
             public TcpClient Client { get; set; }
             public NetworkStream Stream { get; set; }
             public SemaphoreSlim WriteLock { get; } = new SemaphoreSlim(1, 1);
-            public CancellationTokenSource SessionCts { get; set; }
-            public int LastChunkIndex { get; set; }
+            public CancellationTokenSource Cts { get; set; }
+            public bool IsPaused { get; set; }
+            public bool IsCancelled { get; set; }
         }
 
-        private class WaitingPeerSlot
-        {
-            public string PeerId { get; set; }
-            public string PeerName { get; set; }
-            public string TransferId { get; set; }
-            public string FileId { get; set; }
-            public TaskCompletionSource<bool> SlotGrantedTcs { get; } = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        }
-
-        /// <summary>
-        /// 전송할 파일들을 등록하고, 채팅으로 상대방에게 알려줄 메타데이터(파일명/크기/유효시간 등)를 생성합니다.
-        /// </summary>
-        public TransferOffer CreateTransferOffer(IEnumerable<string> filePaths, int p2pPort)
-        {
-            P2PTransferPort = p2pPort;
-            var fileList = new List<FileItemMeta>();
-
-            foreach (var path in filePaths)
-            {
-                var fi = new FileInfo(path);
-                if (!fi.Exists) continue;
-
-                int totalChunks = (int)((fi.Length + DefaultChunkSize - 1) / DefaultChunkSize);
-                if (totalChunks == 0) totalChunks = 1; // 0바이트 파일 대응
-
-                fileList.Add(new FileItemMeta
-                {
-                    FileId = Guid.NewGuid().ToString("N"),
-                    FileName = fi.Name,
-                    FileSize = fi.Length,
-                    ChunkSize = DefaultChunkSize,
-                    TotalChunks = totalChunks,
-                    LocalSourcePath = fi.FullName
-                });
-            }
-
-            if (fileList.Count == 0)
-                throw new ArgumentException("전송할 유효한 파일이 없습니다.");
-
-            var nowUtc = DateTime.UtcNow;
-            var offer = new TransferOffer
-            {
-                TransferId = Guid.NewGuid().ToString("N"),
-                SenderName = NodeName,
-                P2PPort = p2pPort,
-                ChunkSize = DefaultChunkSize,
-                CreatedUtcTicks = nowUtc.Ticks,
-                ExpireUtcTicks = nowUtc.Add(OfferValidDuration).Ticks,
-                Files = fileList
-            };
-
-            _offers[offer.TransferId] = offer;
-            return offer;
-        }
-
-        /// <summary>
-        /// 수신자가 수신을 수락했을 때(또는 미리) P2P TCP 서버 포트를 오픈합니다.
-        /// bindIp가 "127.0.0.1"이면 IPAddress.Loopback으로 바인딩하여 Windows 방화벽 팝업을 방지합니다.
-        /// </summary>
-        public void OpenP2PServer(int p2pPort, string bindIp = null)
-        {
-            if (_isP2PServerRunning && P2PTransferPort == p2pPort) return;
-
-            StopP2PServer();
-
-            P2PTransferPort = p2pPort;
-            _cts = new CancellationTokenSource();
-
-            IPAddress listenAddress = IPAddress.Any;
-            if (!string.IsNullOrWhiteSpace(bindIp) &&
-                (bindIp.Trim() == "127.0.0.1" || bindIp.Trim().Equals("localhost", StringComparison.OrdinalIgnoreCase)))
-            {
-                listenAddress = IPAddress.Loopback;
-            }
-
-            _p2pListener = new TcpListener(listenAddress, P2PTransferPort);
-            _p2pListener.Start();
-            _isP2PServerRunning = true;
-
-            Task.Run(() => AcceptP2PClientsLoopAsync(_cts.Token));
-        }
-
-        /// <summary>
-        /// P2P 서버를 중지하고 모든 연결된 수신자 P2P 세션에 연결 종료를 알립니다. (네트워크 끊김 시뮬레이션 포함)
-        /// </summary>
-        public void StopP2PServer()
-        {
-            _isP2PServerRunning = false;
-
-            // 활성 세션에 Disconnect 프레임 전송 시도 후 소켓 닫기
-            foreach (var kv in _activeSessions)
-            {
-                var session = kv.Value;
-                try
-                {
-                    if (session.Stream != null && session.Client != null && session.Client.Connected)
-                    {
-                        FrameStreamHelper.WriteControlFrameAsync(session.Stream, P2PCommand.Disconnect, session.LastChunkIndex, "SENDER_OFFLINE", CancellationToken.None).Wait(100);
-                    }
-                }
-                catch { }
-                try { session.SessionCts?.Cancel(); } catch { }
-                try { session.Client?.Close(); } catch { }
-            }
-            _activeSessions.Clear();
-
-            try { _cts?.Cancel(); } catch { }
-            try { _p2pListener?.Stop(); } catch { }
-
-            lock (_slotLock)
-            {
-                _activeUploadingPeers.Clear();
-                while (_waitingPeersQueue.Count > 0)
-                {
-                    var waiter = _waitingPeersQueue.Dequeue();
-                    waiter.SlotGrantedTcs.TrySetCanceled();
-                }
-            }
-        }
-
-        private async Task AcceptP2PClientsLoopAsync(CancellationToken ct)
-        {
-            while (!ct.IsCancellationRequested && _isP2PServerRunning)
-            {
-                try
-                {
-                    TcpClient p2pClient = await _p2pListener.AcceptTcpClientAsync().ConfigureAwait(false);
-                    _ = Task.Run(() => HandleP2PSessionAsync(p2pClient, ct));
-                }
-                catch
-                {
-                    if (ct.IsCancellationRequested || !_isP2PServerRunning) break;
-                }
-            }
-        }
-
-        /// <summary>
-        /// 단일 P2P 포트에서 제어 명령(Handshake, RequestChunk, Pause, Resume, Cancel, FileCompleted) 및
-        /// 데이터 패킷(DataChunk)을 주고받는 핵심 P2P 세션 루프
-        /// </summary>
-        private async Task HandleP2PSessionAsync(TcpClient p2pClient, CancellationToken serverCt)
-        {
-            string peerId = null;
-            string peerName = null;
-            string transferId = null;
-            string fileId = null;
-            string sessionKey = null;
-            FileItemMeta fileMeta = null;
-            TransferOffer offer = null;
-
-            using (p2pClient)
-            {
-                p2pClient.NoDelay = true;
-                var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(serverCt);
-                CancellationToken ct = sessionCts.Token;
-
-                try
-                {
-                    NetworkStream stream = p2pClient.GetStream();
-
-                    // 1. 첫 프레임: Handshake 제어 명령 수신
-                    P2PFrame firstFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
-                    if (firstFrame == null || firstFrame.Command != P2PCommand.Handshake)
-                        return;
-
-                    var handshake = FrameStreamHelper.DeserializeJson<HandshakePayload>(firstFrame.GetPayloadText());
-                    if (handshake == null) return;
-
-                    peerId = handshake.PeerId;
-                    peerName = handshake.PeerName;
-                    transferId = handshake.TransferId;
-                    fileId = handshake.FileId;
-                    int initialChunk = Math.Max(0, firstFrame.ChunkIndex);
-
-                    if (!_offers.TryGetValue(transferId, out offer))
-                    {
-                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, "OFFER_NOT_FOUND", ct).ConfigureAwait(false);
-                        return;
-                    }
-
-                    // 30분 유효시간 체크
-                    if (offer.IsExpired)
-                    {
-                        foreach (var f in offer.Files)
-                        {
-                            RaiseProgress(transferId, f.FileId, f.FileName, peerId, peerName, 0, f.TotalChunks, f.ChunkSize, f.FileSize, TransferStatus.Expired, "유효시간(30분) 만료됨");
-                        }
-                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, "EXPIRED", ct).ConfigureAwait(false);
-                        return;
-                    }
-
-                    if (IsCancelled(transferId, peerId))
-                    {
-                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Cancel, 0, "CANCELLED", ct).ConfigureAwait(false);
-                        return;
-                    }
-
-                    fileMeta = offer.Files.FirstOrDefault(f => f.FileId == fileId);
-                    if (fileMeta == null || !File.Exists(fileMeta.LocalSourcePath))
-                    {
-                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, "FILE_MISSING", ct).ConfigureAwait(false);
-                        return;
-                    }
-
-                    sessionKey = $"{transferId}_{peerId}";
-                    var activeSession = new ActivePeerSession
-                    {
-                        TransferId = transferId,
-                        FileId = fileId,
-                        PeerId = peerId,
-                        PeerName = peerName,
-                        Client = p2pClient,
-                        Stream = stream,
-                        SessionCts = sessionCts,
-                        LastChunkIndex = initialChunk
-                    };
-                    _activeSessions[sessionKey] = activeSession;
-
-                    // 2. 동시 수신자 수 제한 체크 (예: 최대 3명. 초과 시 대기열 진입 및 WaitQueue 제어 명령 전송)
-                    bool acquiredImmediately = TryAcquirePeerSlot(peerId, peerName, transferId, fileId, out WaitingPeerSlot waiter);
-                    if (!acquiredImmediately)
-                    {
-                        RaiseProgress(transferId, fileMeta.FileId, fileMeta.FileName, peerId, peerName,
-                            initialChunk, fileMeta.TotalChunks, fileMeta.ChunkSize, fileMeta.FileSize,
-                            TransferStatus.WaitingQueue, $"동시 전송 제한({MaxConcurrentReceivers}명) 대기 중...");
-
-                        await SendSessionFrameAsync(activeSession, P2PCommand.WaitQueue, initialChunk, null, null, ct).ConfigureAwait(false);
-
-                        using (ct.Register(() => waiter.SlotGrantedTcs.TrySetCanceled()))
-                        {
-                            await waiter.SlotGrantedTcs.Task.ConfigureAwait(false);
-                        }
-                    }
-
-                    if (IsCancelled(transferId, peerId))
-                    {
-                        await SendSessionFrameAsync(activeSession, P2PCommand.Cancel, initialChunk, null, null, ct).ConfigureAwait(false);
-                        return;
-                    }
-
-                    // 3. 대기열 통과 -> QueueReady 제어 명령 전송
-                    await SendSessionFrameAsync(activeSession, P2PCommand.QueueReady, initialChunk, null, null, ct).ConfigureAwait(false);
-
-                    // 4. 파일 스트림을 열고 수신자가 보내는 제어/요청 명령(RequestChunk, Pause, Resume, Cancel, FileCompleted)을 처리
-                    using (var fs = new FileStream(fileMeta.LocalSourcePath, FileMode.Open, FileAccess.Read, FileShare.Read))
-                    {
-                        byte[] readBuf = new byte[fileMeta.ChunkSize];
-
-                        while (!ct.IsCancellationRequested)
-                        {
-                            P2PFrame reqFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
-                            if (reqFrame == null)
-                            {
-                                throw new IOException("수신자와의 P2P 연결이 종료되었습니다.");
-                            }
-
-                            if (IsCancelled(transferId, peerId))
-                            {
-                                await SendSessionFrameAsync(activeSession, P2PCommand.Cancel, activeSession.LastChunkIndex, null, null, ct).ConfigureAwait(false);
-                                throw new OperationCanceledException("Transfer cancelled.");
-                            }
-
-                            switch (reqFrame.Command)
-                            {
-                                case P2PCommand.RequestChunk:
-                                    {
-                                        int requestedChunkIdx = reqFrame.ChunkIndex;
-                                        activeSession.LastChunkIndex = requestedChunkIdx;
-
-                                        // 송신자 측에서 일시정지(Pause)를 걸어둔 경우 재개될 때까지 대기
-                                        while (IsPaused(transferId, peerId) && !ct.IsCancellationRequested && !IsCancelled(transferId, peerId))
-                                        {
-                                            await Task.Delay(100, ct).ConfigureAwait(false);
-                                        }
-
-                                        if (requestedChunkIdx < 0 || requestedChunkIdx >= fileMeta.TotalChunks)
-                                        {
-                                            await SendSessionFrameAsync(activeSession, P2PCommand.Error, requestedChunkIdx, null, null, ct).ConfigureAwait(false);
-                                            break;
-                                        }
-
-                                        long offset = (long)requestedChunkIdx * fileMeta.ChunkSize;
-                                        fs.Seek(offset, SeekOrigin.Begin);
-
-                                        int bytesRead = 0;
-                                        if (fileMeta.FileSize > 0)
-                                        {
-                                            bytesRead = await fs.ReadAsync(readBuf, 0, fileMeta.ChunkSize, ct).ConfigureAwait(false);
-                                        }
-
-                                        // 원본 조각의 SHA-256 무결성 해시 (32 bytes)
-                                        byte[] sha256 = ChunkSecurityHelper.ComputeSha256(readBuf, 0, bytesRead);
-
-                                        // 조각 간단 암호화 (XOR 스트림 변환)
-                                        byte[] encryptedChunk = ChunkSecurityHelper.TransformChunk(readBuf, bytesRead, requestedChunkIdx);
-
-                                        var sw = System.Diagnostics.Stopwatch.StartNew();
-
-                                        // DataChunk 패킷 전송 (헤더에 Command=DataChunk, ChunkIndex, PayloadLen, SHA256 포함)
-                                        await SendSessionFrameAsync(activeSession, P2PCommand.DataChunk, requestedChunkIdx, sha256, encryptedChunk, ct).ConfigureAwait(false);
-
-                                        // 전송 속도 제어 (SpeedLimitKbps 옵션 적용)
-                                        int currentSpeedLimit = SpeedLimitKbps;
-                                        if (currentSpeedLimit > 0 && encryptedChunk.Length > 0)
-                                        {
-                                            double targetSeconds = (double)(encryptedChunk.Length + FrameStreamHelper.HeaderSize) / (currentSpeedLimit * 1024.0);
-                                            double elapsedSeconds = sw.Elapsed.TotalSeconds;
-                                            if (targetSeconds > elapsedSeconds)
-                                            {
-                                                int delayMs = (int)((targetSeconds - elapsedSeconds) * 1000);
-                                                if (delayMs > 1)
-                                                {
-                                                    await Task.Delay(delayMs, ct).ConfigureAwait(false);
-                                                }
-                                            }
-                                        }
-
-                                        // 수신자가 요청한 패킷 번호(requestedChunkIdx + 1)와 고정 패킷 크기(fileMeta.ChunkSize)로 전송 상태 산출
-                                        RaiseProgress(transferId, fileMeta.FileId, fileMeta.FileName, peerId, peerName,
-                                            requestedChunkIdx + 1, fileMeta.TotalChunks, fileMeta.ChunkSize, fileMeta.FileSize,
-                                            TransferStatus.Transferring, $"전송 중 ({requestedChunkIdx + 1}/{fileMeta.TotalChunks} 패킷)");
-                                    }
-                                    break;
-
-                                case P2PCommand.Pause:
-                                    {
-                                        _pausedKeys[sessionKey] = true;
-                                        RaiseProgress(transferId, fileMeta.FileId, fileMeta.FileName, peerId, peerName,
-                                            reqFrame.ChunkIndex, fileMeta.TotalChunks, fileMeta.ChunkSize, fileMeta.FileSize,
-                                            TransferStatus.Paused, $"수신자가 일시정지함 ({reqFrame.ChunkIndex}/{fileMeta.TotalChunks} 패킷)");
-                                    }
-                                    break;
-
-                                case P2PCommand.Resume:
-                                    {
-                                        _pausedKeys.TryRemove(sessionKey, out _);
-                                        RaiseProgress(transferId, fileMeta.FileId, fileMeta.FileName, peerId, peerName,
-                                            reqFrame.ChunkIndex, fileMeta.TotalChunks, fileMeta.ChunkSize, fileMeta.FileSize,
-                                            TransferStatus.Transferring, $"전송 재개됨 ({reqFrame.ChunkIndex}/{fileMeta.TotalChunks} 패킷~)");
-                                    }
-                                    break;
-
-                                case P2PCommand.Cancel:
-                                    {
-                                        _cancelledKeys[sessionKey] = true;
-                                        RaiseProgress(transferId, fileMeta.FileId, fileMeta.FileName, peerId, peerName,
-                                            reqFrame.ChunkIndex, fileMeta.TotalChunks, fileMeta.ChunkSize, fileMeta.FileSize,
-                                            TransferStatus.Cancelled, "수신자가 전송을 취소함");
-                                        ReleasePeerSlot(peerId);
-                                        return;
-                                    }
-
-                                case P2PCommand.FileCompleted:
-                                    {
-                                        RaiseProgress(transferId, fileMeta.FileId, fileMeta.FileName, peerId, peerName,
-                                            fileMeta.TotalChunks, fileMeta.TotalChunks, fileMeta.ChunkSize, fileMeta.FileSize,
-                                            TransferStatus.Completed, "전송 완료");
-
-                                        // 해당 수신자의 이번 Offer 내 마지막 파일까지 완료되었으면 동시전송 슬롯 반환
-                                        if (offer.Files.Last().FileId == fileMeta.FileId)
-                                        {
-                                            ReleasePeerSlot(peerId);
-                                        }
-                                        return;
-                                    }
-                            }
-                        }
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    if (fileMeta != null && peerId != null)
-                    {
-                        bool isUserCancel = IsCancelled(transferId, peerId);
-                        int lastChunk = _activeSessions.TryGetValue(sessionKey ?? "", out var s) ? s.LastChunkIndex : 0;
-                        RaiseProgress(transferId, fileMeta.FileId, fileMeta.FileName, peerId, peerName ?? peerId,
-                            lastChunk, fileMeta.TotalChunks, fileMeta.ChunkSize, fileMeta.FileSize,
-                            isUserCancel ? TransferStatus.Cancelled : TransferStatus.Error,
-                            isUserCancel ? "전송 취소됨" : $"연결 중단 ({lastChunk}/{fileMeta.TotalChunks} 패킷 완료 - 재접속 시 이어받기)");
-                    }
-                    if (peerId != null) ReleasePeerSlot(peerId);
-                }
-                catch (Exception ex)
-                {
-                    if (fileMeta != null && peerId != null)
-                    {
-                        bool isUserCancel = IsCancelled(transferId, peerId);
-                        int lastChunk = _activeSessions.TryGetValue(sessionKey ?? "", out var s) ? s.LastChunkIndex : 0;
-                        RaiseProgress(transferId, fileMeta.FileId, fileMeta.FileName, peerId, peerName ?? peerId,
-                            lastChunk, fileMeta.TotalChunks, fileMeta.ChunkSize, fileMeta.FileSize,
-                            isUserCancel ? TransferStatus.Cancelled : TransferStatus.Error,
-                            isUserCancel ? "전송 취소됨" : $"오류 중단: {ex.Message} ({lastChunk}/{fileMeta.TotalChunks} 패킷 완료 - 이어받기 대기)");
-                    }
-                    if (peerId != null) ReleasePeerSlot(peerId);
-                }
-                finally
-                {
-                    if (sessionKey != null)
-                    {
-                        _activeSessions.TryRemove(sessionKey, out _);
-                    }
-                }
-            }
-        }
-
-        private async Task SendSessionFrameAsync(ActivePeerSession session, P2PCommand cmd, int chunkIndex, byte[] hash32, byte[] payload, CancellationToken ct)
+        private async Task SendSessionFrameAsync(ClientSession session, P2PCommand cmd, int chunkIndex, byte[] hash32, byte[] payload, CancellationToken ct)
         {
             await session.WriteLock.WaitAsync(ct).ConfigureAwait(false);
             try
@@ -514,219 +118,503 @@ namespace P2PTransferLib
             }
         }
 
-        /// <summary>
-        /// 송신자 측에서 특정 수신자(또는 전체) 전송을 일시정지(Pause) 제어 명령으로 보냅니다.
-        /// </summary>
-        public async Task PauseTransferAsync(string transferId, string targetPeerId)
+        private Task SendSessionControlAsync(ClientSession session, P2PCommand cmd, int chunkIndex, string textPayload, CancellationToken ct)
         {
-            string key = $"{transferId}_{targetPeerId}";
-            _pausedKeys[key] = true;
+            byte[] payload = string.IsNullOrEmpty(textPayload) ? null : System.Text.Encoding.UTF8.GetBytes(textPayload);
+            return SendSessionFrameAsync(session, cmd, chunkIndex, null, payload, ct);
+        }
 
-            if (_activeSessions.TryGetValue(key, out var session))
+        public static string BuildFileKey(string chId, string msgId)
+        {
+            return $"{(chId ?? "").Trim()}_{(msgId ?? "").Trim()}";
+        }
+
+        /// <summary>
+        /// 1. 송신자(서버) P2P TCP 포트를 백그라운드로 오픈합니다.
+        /// </summary>
+        public void StartServer(int port, string bindIp = "127.0.0.1")
+        {
+            if (_isRunning) return;
+
+            Port = port;
+            _cts = new CancellationTokenSource();
+
+            IPAddress ip = IPAddress.Any;
+            if (!string.IsNullOrWhiteSpace(bindIp) &&
+                (bindIp.Trim() == "127.0.0.1" || bindIp.Trim().Equals("localhost", StringComparison.OrdinalIgnoreCase)))
             {
-                try
-                {
-                    await SendSessionFrameAsync(session, P2PCommand.Pause, session.LastChunkIndex, null, null, CancellationToken.None).ConfigureAwait(false);
-                }
-                catch { }
+                ip = IPAddress.Loopback; // 로컬 테스트 시 방화벽 팝업 방지
+            }
 
-                if (_offers.TryGetValue(transferId, out var offer))
+            _listener = new TcpListener(ip, port);
+            _listener.Start();
+            _isRunning = true;
+
+            Log($"[서버 시작] P2P 송신 서버 포트 오픈 완료 (Bind={ip}:{port}, 패킷크기={ChunkSize / 1024}KB, 동시제한={MaxConcurrentReceivers})");
+            Task.Run(() => AcceptClientsLoopAsync(_cts.Token));
+        }
+
+        /// <summary>
+        /// 송신자(서버) 포트를 닫고 진행 중인 모든 연결을 중단합니다.
+        /// </summary>
+        public void StopServer()
+        {
+            if (!_isRunning) return;
+            _isRunning = false;
+
+            try { _cts?.Cancel(); } catch { }
+            try { _listener?.Stop(); } catch { }
+
+            foreach (var kv in _activeSessions)
+            {
+                try { kv.Value.Cts?.Cancel(); } catch { }
+                try { kv.Value.Client?.Close(); } catch { }
+            }
+            _activeSessions.Clear();
+
+            lock (_queueLock)
+            {
+                _activeTransferCount = 0;
+                while (_waitingQueue.Count > 0)
                 {
-                    var f = offer.Files.FirstOrDefault(x => x.FileId == session.FileId);
-                    if (f != null)
+                    _waitingQueue.Dequeue().TrySetCanceled();
+                }
+            }
+
+            Log("[서버 중지] P2P 송신 서버가 중지되었습니다.");
+        }
+
+        /// <summary>
+        /// 2. 전송할 파일과 채널ID(chId), 파일ID(msgId)를 서버에 등록합니다. (유효시간 기본 30분)
+        /// </summary>
+        public RegisteredFileItem RegisterFile(string chId, string msgId, string filePath)
+        {
+            if (string.IsNullOrWhiteSpace(chId)) chId = "DEFAULT_CH";
+            if (string.IsNullOrWhiteSpace(msgId))
+                throw new ArgumentException("파일ID(msgId)를 입력해야 합니다.");
+            if (!File.Exists(filePath))
+                throw new FileNotFoundException("등록할 파일이 존재하지 않습니다.", filePath);
+
+            var fi = new FileInfo(filePath);
+            int totalChunks = (int)((fi.Length + ChunkSize - 1) / ChunkSize);
+            if (totalChunks == 0) totalChunks = 1;
+
+            var nowUtc = DateTime.UtcNow;
+            var item = new RegisteredFileItem
+            {
+                ChId = chId.Trim(),
+                MsgId = msgId.Trim(),
+                FileName = fi.Name,
+                LocalSourcePath = fi.FullName,
+                FileSize = fi.Length,
+                ChunkSize = ChunkSize,
+                TotalChunks = totalChunks,
+                CreatedUtcTicks = nowUtc.Ticks,
+                ExpireUtcTicks = nowUtc.Add(ValidDuration).Ticks
+            };
+
+            string key = BuildFileKey(item.ChId, item.MsgId);
+            _registeredFiles[key] = item;
+            Log($"[파일 등록] chID='{item.ChId}', msgID='{item.MsgId}', 파일명='{item.FileName}', 크기={FormatBytes(item.FileSize)} (총 {item.TotalChunks}패킷, 유효시간:{item.RemainingValidTimeText})");
+            return item;
+        }
+
+        /// <summary>
+        /// [송신 파일 목록 조회 1]
+        /// 등록된 송신 파일들의 목록과 각 파일의 상태(Ready, Expired, FileMissing) 및 남은 유효시간(RemainingValidTimeText)을 조회합니다.
+        /// (chId를 지정하면 해당 채널의 파일만 조회하고, null이면 전체 조회)
+        /// </summary>
+        public List<RegisteredFileItem> GetRegisteredFiles(string chId = null)
+        {
+            var query = _registeredFiles.Values.AsEnumerable();
+            if (!string.IsNullOrWhiteSpace(chId))
+            {
+                query = query.Where(x => x.ChId == chId.Trim());
+            }
+            return query.OrderBy(x => x.CreatedUtcTicks).ToList();
+        }
+
+        /// <summary>
+        /// [송신 전송 상태 목록 조회 2]
+        /// 각 수신자(사번/이름)별로 현재 전송 중이거나 완료/취소/대기 중인 송신 상태와 진행률(%), 남은 유효시간을 조회합니다.
+        /// </summary>
+        public List<SenderTransferStatusItem> GetSenderTransferList(string chId = null, string msgId = null)
+        {
+            var query = _transferStatusMap.Values.AsEnumerable();
+            if (!string.IsNullOrWhiteSpace(chId))
+                query = query.Where(x => x.ChId == chId.Trim());
+            if (!string.IsNullOrWhiteSpace(msgId))
+                query = query.Where(x => x.MsgId == msgId.Trim());
+
+            return query.ToList();
+        }
+
+        /// <summary>
+        /// 송신자 측에서 특정 채널ID(chId) + 파일ID(msgId) 또는 특정 사번(peerId)의 전송을 취소합니다.
+        /// </summary>
+        public void CancelTransfer(string chId, string msgId, string peerId = null)
+        {
+            foreach (var kv in _activeSessions)
+            {
+                var s = kv.Value;
+                if ((string.IsNullOrEmpty(chId) || s.ChId == chId) &&
+                    (string.IsNullOrEmpty(msgId) || s.MsgId == msgId) &&
+                    (string.IsNullOrEmpty(peerId) || s.PeerId == peerId))
+                {
+                    s.IsCancelled = true;
+                    try
                     {
-                        RaiseProgress(transferId, f.FileId, f.FileName, session.PeerId, session.PeerName,
-                            session.LastChunkIndex, f.TotalChunks, f.ChunkSize, f.FileSize, TransferStatus.Paused, "송신자가 일시정지함");
+                        SendSessionControlAsync(s, P2PCommand.Cancel, s.LastChunkIndex, "송신자에 의해 취소됨", CancellationToken.None).Wait(150);
+                    }
+                    catch { }
+                    try { s.Cts?.Cancel(); } catch { }
+
+                    Log($"[송신 취소] chID='{s.ChId}', msgID='{s.MsgId}', 수신자={s.PeerName}({s.PeerId}) 전송 취소됨.");
+                    if (s.FileItem != null)
+                    {
+                        RaiseProgress(s.SessionKey, s.FileItem, s.PeerId, s.PeerName, s.LastChunkIndex, TransferStatus.Cancelled, "송신자에 의해 취소됨");
                     }
                 }
             }
         }
 
-        /// <summary>
-        /// 송신자 측에서 일시정지된 전송을 재개(Resume) 제어 명령으로 보냅니다.
-        /// </summary>
-        public async Task ResumeTransferAsync(string transferId, string targetPeerId)
+        private async Task AcceptClientsLoopAsync(CancellationToken ct)
         {
-            string key = $"{transferId}_{targetPeerId}";
-            _pausedKeys.TryRemove(key, out _);
-
-            if (_activeSessions.TryGetValue(key, out var session))
+            while (!ct.IsCancellationRequested && _isRunning)
             {
                 try
                 {
-                    await SendSessionFrameAsync(session, P2PCommand.Resume, session.LastChunkIndex, null, null, CancellationToken.None).ConfigureAwait(false);
+                    TcpClient client = await _listener.AcceptTcpClientAsync().ConfigureAwait(false);
+                    _ = Task.Run(() => HandleClientSessionAsync(client, ct));
                 }
-                catch { }
+                catch
+                {
+                    if (ct.IsCancellationRequested || !_isRunning) break;
+                }
             }
         }
 
-        /// <summary>
-        /// 송신자가 특정 수신자(또는 전체 수신자)에 대한 전송을 취소합니다.
-        /// P2P 연결이 수립된 상태라면 P2P 제어 명령(Cancel)을 즉시 전송하고, 연결 수립 전이라도 취소 상태로 등록합니다.
-        /// </summary>
-        public async Task CancelTransferAsync(string transferId, string targetPeerId = null, string targetPeerName = null)
+        private async Task HandleClientSessionAsync(TcpClient tcpClient, CancellationToken serverCt)
         {
-            var targetSessions = string.IsNullOrEmpty(targetPeerId)
-                ? _activeSessions.Values.Where(s => s.TransferId == transferId).ToList()
-                : _activeSessions.Values.Where(s => s.TransferId == transferId && s.PeerId == targetPeerId).ToList();
+            string sessionKey = Guid.NewGuid().ToString("N");
+            string peerId = "";
+            string peerName = "";
+            string chId = "";
+            string msgId = "";
+            RegisteredFileItem fileItem = null;
+            ClientSession session = null;
+            bool slotAcquired = false;
 
-            if (string.IsNullOrEmpty(targetPeerId))
+            using (tcpClient)
             {
-                _cancelledKeys[transferId] = true;
-            }
-            else
-            {
-                _cancelledKeys[$"{transferId}_{targetPeerId}"] = true;
-                ReleasePeerSlot(targetPeerId);
-            }
+                tcpClient.NoDelay = true;
+                var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(serverCt);
+                CancellationToken ct = sessionCts.Token;
 
-            foreach (var session in targetSessions)
-            {
                 try
                 {
-                    await SendSessionFrameAsync(session, P2PCommand.Cancel, session.LastChunkIndex, null, null, CancellationToken.None).ConfigureAwait(false);
-                }
-                catch { }
-                try { session.SessionCts?.Cancel(); } catch { }
-                ReleasePeerSlot(session.PeerId);
+                    NetworkStream stream = tcpClient.GetStream();
 
-                if (_offers.TryGetValue(transferId, out var offer))
-                {
-                    foreach (var f in offer.Files)
+                    // 1. 수신자로부터 Handshake 패킷 수신 (peerId:사번, peerName:이름, chId:채널ID, msgId:파일ID)
+                    P2PFrame hsFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
+                    if (hsFrame == null || hsFrame.Command != P2PCommand.Handshake)
+                        return;
+
+                    var req = FrameStreamHelper.DeserializeJson<HandshakeRequest>(hsFrame.GetPayloadText());
+                    if (req == null) return;
+
+                    peerId = req.PeerId ?? "UnknownID";
+                    peerName = req.PeerName ?? "UnknownName";
+                    chId = string.IsNullOrWhiteSpace(req.ChId) ? "DEFAULT_CH" : req.ChId.Trim();
+                    msgId = (req.MsgId ?? "").Trim();
+                    int startChunk = hsFrame.ChunkIndex;
+
+                    Log($"[수신자 요청 확인] 사번(peerID)='{peerId}', 이름(peerName)='{peerName}', 채널ID(chID)='{chId}', 파일ID(msgID)='{msgId}', 요청 시작패킷={startChunk}번");
+
+                    // 2. 요청한 (chId + msgId) 파일이 등록되어 있는지 확인
+                    string fileKey = BuildFileKey(chId, msgId);
+                    if (!_registeredFiles.TryGetValue(fileKey, out fileItem))
                     {
-                        RaiseProgress(transferId, f.FileId, f.FileName, session.PeerId, session.PeerName,
-                            0, f.TotalChunks, f.ChunkSize, f.FileSize, TransferStatus.Cancelled, "송신자에 의해 취소됨");
+                        Log($"[요청 거부] 미등록 파일 (chID='{chId}', msgID='{msgId}') 요청됨 - 사번:{peerId}({peerName})");
+                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, $"등록되지 않은 파일(chID:{chId}, msgID:{msgId}) 입니다.", ct).ConfigureAwait(false);
+                        return;
+                    }
+
+                    // 3. 30분 유효시간 만료 여부 확인
+                    if (fileItem.IsExpired)
+                    {
+                        Log($"[요청 거부] chID='{chId}', msgID='{msgId}' 유효시간(30분) 만료됨 - 사번:{peerId}({peerName})");
+                        RaiseProgress(sessionKey, fileItem, peerId, peerName, startChunk, TransferStatus.Expired, "유효시간(30분) 만료됨");
+                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, "EXPIRED:유효시간(30분)이 만료된 파일입니다.", ct).ConfigureAwait(false);
+                        return;
+                    }
+
+                    if (!File.Exists(fileItem.LocalSourcePath))
+                    {
+                        Log($"[요청 거부] 원본 파일 없음 ({fileItem.LocalSourcePath})");
+                        RaiseProgress(sessionKey, fileItem, peerId, peerName, startChunk, TransferStatus.FileMissing, "원본 파일 없음");
+                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, "서버에 원본 파일이 존재하지 않습니다.", ct).ConfigureAwait(false);
+                        return;
+                    }
+
+                    session = new ClientSession
+                    {
+                        SessionKey = sessionKey,
+                        PeerId = peerId,
+                        PeerName = peerName,
+                        ChId = chId,
+                        MsgId = msgId,
+                        FileItem = fileItem,
+                        LastChunkIndex = startChunk,
+                        Client = tcpClient,
+                        Stream = stream,
+                        Cts = sessionCts
+                    };
+                    _activeSessions[sessionKey] = session;
+
+                    // 4. 수신자에게 파일 메타데이터(HandshakeAck - 유효시간 ExpireUtcTicks 포함) 전송
+                    var ackMeta = new HandshakeResponse
+                    {
+                        ChId = fileItem.ChId,
+                        MsgId = fileItem.MsgId,
+                        FileName = fileItem.FileName,
+                        FileSize = fileItem.FileSize,
+                        ChunkSize = fileItem.ChunkSize,
+                        TotalChunks = fileItem.TotalChunks,
+                        CreatedUtcTicks = fileItem.CreatedUtcTicks,
+                        ExpireUtcTicks = fileItem.ExpireUtcTicks
+                    };
+                    await SendSessionControlAsync(session, P2PCommand.HandshakeAck, startChunk, FrameStreamHelper.SerializeJson(ackMeta), ct).ConfigureAwait(false);
+
+                    // 5. 동시 전송 제한 확인 (초과 시 WaitQueue 명령 보내고 슬롯이 빌 때까지 대기)
+                    if (!TryAcquireSlot(out TaskCompletionSource<bool> waiterTcs))
+                    {
+                        Log($"[수신 대기열 진입] 사번:{peerId}({peerName}), chID:'{chId}', msgID:'{msgId}' - 동시 전송 제한({MaxConcurrentReceivers}개) 초과로 대기 중...");
+                        RaiseProgress(sessionKey, fileItem, peerId, peerName, startChunk, TransferStatus.WaitingQueue, "동시 전송 제한 대기 중");
+                        await SendSessionControlAsync(session, P2PCommand.WaitQueue, startChunk, "동시 전송 제한 대기 중...", ct).ConfigureAwait(false);
+
+                        using (ct.Register(() => waiterTcs.TrySetCanceled()))
+                        {
+                            await waiterTcs.Task.ConfigureAwait(false);
+                        }
+                    }
+                    slotAcquired = true;
+
+                    // 6. 대기열 통과 -> QueueReady 전송
+                    Log($"[전송 시작 승인] 사번:{peerId}({peerName}), chID:'{chId}', msgID:'{msgId}' ({fileItem.FileName}) 패킷 전송을 시작합니다.");
+                    await SendSessionControlAsync(session, P2PCommand.QueueReady, startChunk, "READY", ct).ConfigureAwait(false);
+
+                    // 7. 수신자가 한 패킷씩 번호(RequestChunk)를 요청하면 해당 패킷을 암호화+SHA256과 함께 전송
+                    using (var fs = new FileStream(fileItem.LocalSourcePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    {
+                        byte[] readBuf = new byte[fileItem.ChunkSize];
+
+                        while (!ct.IsCancellationRequested && !session.IsCancelled)
+                        {
+                            P2PFrame reqFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
+                            if (reqFrame == null)
+                            {
+                                throw new IOException("수신자 연결이 끊어졌습니다.");
+                            }
+
+                            switch (reqFrame.Command)
+                            {
+                                case P2PCommand.RequestChunk:
+                                    {
+                                        int chunkIdx = reqFrame.ChunkIndex;
+                                        if (chunkIdx < 0 || chunkIdx >= fileItem.TotalChunks)
+                                        {
+                                            await SendSessionControlAsync(session, P2PCommand.Error, chunkIdx, $"잘못된 패킷 번호({chunkIdx}) 요청됨", ct).ConfigureAwait(false);
+                                            break;
+                                        }
+
+                                        session.LastChunkIndex = chunkIdx;
+
+                                        while (session.IsPaused && !ct.IsCancellationRequested && !session.IsCancelled)
+                                        {
+                                            await Task.Delay(100, ct).ConfigureAwait(false);
+                                        }
+
+                                        if (session.IsCancelled) break;
+
+                                        long offset = (long)chunkIdx * fileItem.ChunkSize;
+                                        fs.Seek(offset, SeekOrigin.Begin);
+
+                                        int bytesRead = 0;
+                                        if (fileItem.FileSize > 0)
+                                        {
+                                            bytesRead = await fs.ReadAsync(readBuf, 0, fileItem.ChunkSize, ct).ConfigureAwait(false);
+                                        }
+
+                                        // SHA-256 무결성 해시 및 XOR 조각 암호화
+                                        byte[] sha256 = ChunkSecurityHelper.ComputeSha256(readBuf, 0, bytesRead);
+                                        byte[] encrypted = ChunkSecurityHelper.TransformChunk(readBuf, bytesRead, chunkIdx);
+
+                                        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+                                        await SendSessionFrameAsync(session, P2PCommand.DataChunk, chunkIdx, sha256, encrypted, ct).ConfigureAwait(false);
+
+                                        // 속도 제한(KB/s) 적용
+                                        int limit = SpeedLimitKbps;
+                                        if (limit > 0 && encrypted.Length > 0)
+                                        {
+                                            double targetSec = (double)(encrypted.Length + FrameStreamHelper.HeaderSize) / (limit * 1024.0);
+                                            double elapsedSec = sw.Elapsed.TotalSeconds;
+                                            if (targetSec > elapsedSec)
+                                            {
+                                                int delayMs = (int)((targetSec - elapsedSec) * 1000);
+                                                if (delayMs > 1) await Task.Delay(delayMs, ct).ConfigureAwait(false);
+                                            }
+                                        }
+
+                                        int doneCount = chunkIdx + 1;
+                                        session.LastChunkIndex = doneCount;
+                                        double pct = fileItem.TotalChunks > 0 ? (doneCount * 100.0 / fileItem.TotalChunks) : 100.0;
+
+                                        if (doneCount == 1 || doneCount == fileItem.TotalChunks || doneCount % 5 == 0)
+                                        {
+                                            Log($"[패킷 송신] -> {peerName}({peerId}) | chID:{chId} | msgID:{msgId} ({fileItem.FileName}) | 패킷 {doneCount}/{fileItem.TotalChunks} ({pct:0.0}%)");
+                                        }
+
+                                        RaiseProgress(sessionKey, fileItem, peerId, peerName, doneCount, TransferStatus.Transferring, $"전송 중 ({doneCount}/{fileItem.TotalChunks})");
+                                    }
+                                    break;
+
+                                case P2PCommand.Pause:
+                                    session.IsPaused = true;
+                                    Log($"[일시정지] 수신자 {peerName}({peerId}) | chID:{chId} | msgID:{msgId} 일시정지됨 (패킷 {reqFrame.ChunkIndex}/{fileItem.TotalChunks})");
+                                    RaiseProgress(sessionKey, fileItem, peerId, peerName, reqFrame.ChunkIndex, TransferStatus.Paused, "일시정지됨");
+                                    break;
+
+                                case P2PCommand.Resume:
+                                    session.IsPaused = false;
+                                    Log($"[전송 재개] 수신자 {peerName}({peerId}) | chID:{chId} | msgID:{msgId} 전송 재개됨 (패킷 {reqFrame.ChunkIndex}번~)");
+                                    RaiseProgress(sessionKey, fileItem, peerId, peerName, reqFrame.ChunkIndex, TransferStatus.Transferring, "전송 재개됨");
+                                    break;
+
+                                case P2PCommand.Cancel:
+                                    session.IsCancelled = true;
+                                    Log($"[수신자 취소] 수신자 {peerName}({peerId}) | chID:{chId} | msgID:{msgId} 전송을 취소했습니다.");
+                                    RaiseProgress(sessionKey, fileItem, peerId, peerName, reqFrame.ChunkIndex, TransferStatus.Cancelled, "수신자가 취소함");
+                                    return;
+
+                                case P2PCommand.FileCompleted:
+                                    Log($"[송신 완료] -> {peerName}({peerId}) | chID:{chId} | msgID:{msgId} ({fileItem.FileName}) 모든 패킷({fileItem.TotalChunks}개) 전송 및 병합 완료!");
+                                    RaiseProgress(sessionKey, fileItem, peerId, peerName, fileItem.TotalChunks, TransferStatus.Completed, "전송 완료");
+                                    return;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (fileItem != null && (session == null || !session.IsCancelled))
+                    {
+                        int lastIdx = session != null ? session.LastChunkIndex : 0;
+                        Log($"[송신 중단/오류] 수신자:{peerName}({peerId}), chID:{chId}, msgID:{msgId} - {ex.Message} (패킷 {lastIdx}/{fileItem.TotalChunks} 완료 - 이어받기 가능)");
+                        RaiseProgress(sessionKey, fileItem, peerId, peerName, lastIdx, TransferStatus.Error, ex.Message);
+                    }
+                }
+                finally
+                {
+                    _activeSessions.TryRemove(sessionKey, out _);
+                    if (slotAcquired)
+                    {
+                        ReleaseSlot();
                     }
                 }
             }
-
-            // 아직 P2P 연결을 시작하지 않은(PendingAccept) 수신자에 대해서도 UI 상태가 즉시 취소됨으로 반영되도록 이벤트 발생
-            if (!string.IsNullOrEmpty(targetPeerId) && targetSessions.Count == 0 && _offers.TryGetValue(transferId, out var pendingOffer))
-            {
-                foreach (var f in pendingOffer.Files)
-                {
-                    RaiseProgress(transferId, f.FileId, f.FileName, targetPeerId, targetPeerName ?? targetPeerId,
-                        0, f.TotalChunks, f.ChunkSize, f.FileSize, TransferStatus.Cancelled, "송신자에 의해 취소됨 (연결 전 취소)");
-                }
-            }
         }
 
-        /// <summary>
-        /// 수신자가 P2P 연결(수신 시작)을 누르기 전에 채팅 메시지로 수신 거절/취소를 알려왔을 때 호출합니다.
-        /// </summary>
-        public void NotifyCancelledByPeerBeforeConnection(string transferId, string peerId, string peerName)
+        private bool TryAcquireSlot(out TaskCompletionSource<bool> waiterTcs)
         {
-            string key = $"{transferId}_{peerId}";
-            _cancelledKeys[key] = true;
-            ReleasePeerSlot(peerId);
-
-            if (_activeSessions.TryGetValue(key, out var session))
+            waiterTcs = null;
+            lock (_queueLock)
             {
-                try { session.SessionCts?.Cancel(); } catch { }
-            }
-
-            if (_offers.TryGetValue(transferId, out var offer))
-            {
-                foreach (var f in offer.Files)
+                if (_activeTransferCount < _maxConcurrentReceivers && _waitingQueue.Count == 0)
                 {
-                    RaiseProgress(transferId, f.FileId, f.FileName, peerId, peerName ?? peerId,
-                        0, f.TotalChunks, f.ChunkSize, f.FileSize, TransferStatus.Cancelled, "수신자가 수신 시작 전 취소함");
-                }
-            }
-        }
-
-        private bool TryAcquirePeerSlot(string peerId, string peerName, string transferId, string fileId, out WaitingPeerSlot waiter)
-        {
-            waiter = null;
-            lock (_slotLock)
-            {
-                if (_activeUploadingPeers.Contains(peerId))
-                {
+                    _activeTransferCount++;
                     return true;
                 }
 
-                if (_activeUploadingPeers.Count < _maxConcurrentReceivers && _waitingPeersQueue.Count == 0)
-                {
-                    _activeUploadingPeers.Add(peerId);
-                    return true;
-                }
-
-                waiter = new WaitingPeerSlot
-                {
-                    PeerId = peerId,
-                    PeerName = peerName,
-                    TransferId = transferId,
-                    FileId = fileId
-                };
-                _waitingPeersQueue.Enqueue(waiter);
+                waiterTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                _waitingQueue.Enqueue(waiterTcs);
                 return false;
             }
         }
 
-        private void ReleasePeerSlot(string peerId)
+        private void ReleaseSlot()
         {
-            lock (_slotLock)
+            lock (_queueLock)
             {
-                _activeUploadingPeers.Remove(peerId);
+                if (_activeTransferCount > 0)
+                    _activeTransferCount--;
             }
-            ProcessWaitingReceiversQueue();
+            ProcessWaitingQueue();
         }
 
-        private void ProcessWaitingReceiversQueue()
+        private void ProcessWaitingQueue()
         {
-            lock (_slotLock)
+            lock (_queueLock)
             {
-                while (_activeUploadingPeers.Count < _maxConcurrentReceivers && _waitingPeersQueue.Count > 0)
+                while (_activeTransferCount < _maxConcurrentReceivers && _waitingQueue.Count > 0)
                 {
-                    var nextWaiter = _waitingPeersQueue.Dequeue();
-                    if (IsCancelled(nextWaiter.TransferId, nextWaiter.PeerId))
+                    var next = _waitingQueue.Dequeue();
+                    if (next.TrySetResult(true))
                     {
-                        nextWaiter.SlotGrantedTcs.TrySetCanceled();
-                        continue;
+                        _activeTransferCount++;
                     }
-
-                    _activeUploadingPeers.Add(nextWaiter.PeerId);
-                    nextWaiter.SlotGrantedTcs.TrySetResult(true);
                 }
             }
         }
 
-        private bool IsCancelled(string transferId, string peerId)
+        private void Log(string msg)
         {
-            return _cancelledKeys.ContainsKey(transferId) || _cancelledKeys.ContainsKey($"{transferId}_{peerId}");
+            OnLog?.Invoke($"[{DateTime.Now:HH:mm:ss.fff}] {msg}");
         }
 
-        private bool IsPaused(string transferId, string peerId)
+        private void RaiseProgress(string sessionKey, RegisteredFileItem item, string peerId, string peerName, int completedChunks, TransferStatus status, string message)
         {
-            return _pausedKeys.ContainsKey(transferId) || _pausedKeys.ContainsKey($"{transferId}_{peerId}");
-        }
-
-        private void RaiseProgress(string transferId, string fileId, string fileName, string peerId, string peerName,
-            int completedChunkCount, int totalChunks, int chunkSize, long totalBytes, TransferStatus status, string message)
-        {
-            // 패킷 크기(chunkSize)가 일정하므로 완료된 패킷 번호(completedChunkCount)만으로 전송된 바이트와 진행률을 계산
-            long transferredBytes = Math.Min(totalBytes, (long)completedChunkCount * chunkSize);
-
-            TransferProgressUpdated?.Invoke(this, new TransferProgressEventArgs
+            // 송신 상태 목록(_transferStatusMap) 자동 갱신
+            string mapKey = $"{item.ChId}_{item.MsgId}_{peerId}";
+            _transferStatusMap[mapKey] = new SenderTransferStatusItem
             {
-                TransferId = transferId,
-                FileId = fileId,
-                FileName = fileName,
+                SessionKey = sessionKey,
+                ChId = item.ChId,
+                MsgId = item.MsgId,
+                FileName = item.FileName,
+                FileSize = item.FileSize,
                 PeerId = peerId,
                 PeerName = peerName,
-                CurrentChunkIndex = completedChunkCount,
-                TotalChunks = totalChunks,
-                ChunkSize = chunkSize,
-                TransferredBytes = transferredBytes,
-                TotalBytes = totalBytes,
+                CurrentChunkIndex = completedChunks,
+                TotalChunks = item.TotalChunks,
                 Status = status,
+                ExpireTimeUtc = item.ExpireTimeUtc
+            };
+
+            long transferred = Math.Min(item.FileSize, (long)completedChunks * item.ChunkSize);
+            OnProgress?.Invoke(this, new TransferProgressEventArgs
+            {
+                SessionKey = sessionKey,
+                ChId = item.ChId,
+                MsgId = item.MsgId,
+                FileName = item.FileName,
+                PeerId = peerId,
+                PeerName = peerName,
+                CurrentChunkIndex = completedChunks,
+                TotalChunks = item.TotalChunks,
+                ChunkSize = item.ChunkSize,
+                TransferredBytes = transferred,
+                TotalBytes = item.FileSize,
+                Status = status,
+                ExpireTimeUtc = item.ExpireTimeUtc,
                 Message = message
             });
         }
 
         public static string FormatBytes(long bytes)
         {
-            string[] units = { "B", "KB", "MB", "GB", "TB" };
+            string[] units = { "B", "KB", "MB", "GB" };
             double val = bytes;
             int idx = 0;
             while (val >= 1024 && idx < units.Length - 1)
@@ -739,16 +627,7 @@ namespace P2PTransferLib
 
         public void Dispose()
         {
-            StopP2PServer();
+            StopServer();
         }
-    }
-
-    [Serializable]
-    public class HandshakePayload
-    {
-        public string TransferId { get; set; }
-        public string FileId { get; set; }
-        public string PeerId { get; set; }
-        public string PeerName { get; set; }
     }
 }

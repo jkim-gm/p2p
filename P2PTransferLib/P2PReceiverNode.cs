@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
@@ -9,532 +10,497 @@ using System.Threading.Tasks;
 namespace P2PTransferLib
 {
     /// <summary>
-    /// P2P 수신자(B, C, D, E, F...) 측 순수 P2P 파일 수신 엔진 클래스 (채팅 통신 분리됨)
-    /// - 채팅(외부 앱)으로부터 최초 전달받은 TransferOffer(파일명/크기/유효시간)를 등록
-    /// - 수신 수락 시 P2P 포트로 직접 연결하여 Handshake 및 조각 번호(RequestChunk) 요청
-    /// - 패킷 크기가 일정하므로 조각 번호(ChunkIndex)만으로 진행률 산출
-    /// - 프레임 헤더의 P2PCommand로 데이터 패킷(DataChunk)과 제어 명령(WaitQueue, QueueReady, Pause, Resume, Cancel, Disconnect 등) 처리
-    /// - 다중 파일 순차 수신, 조각 복호화 및 SHA-256 무결성 검증 후 병합(Merge)
-    /// - 일시정지(Pause) / 재개(Resume) / 취소(Cancel) / 네트워크 단절 시 재접속 이어받기 지원
+    /// 개별 수신 작업(Receiver 인스턴스 1개)의 상태, 유효시간 및 제어 정보를 담는 클래스
+    /// P2PReceiverNode.Instance.GetReceiverList()로 조회할 때 상태와 남은 유효시간, 파일 존재 여부('파일없음')까지 모두 확인할 수 있습니다.
+    /// </summary>
+    public class P2PReceiverItem
+    {
+        public string TaskKey { get; set; }
+        public string ServerIp { get; set; }
+        public int ServerPort { get; set; }
+        public string PeerId { get; set; }      // 사번
+        public string PeerName { get; set; }    // 이름
+        public string ChId { get; set; }        // 채널ID (chID)
+        public string MsgId { get; set; }       // 파일ID (msgID)
+        public string FileName { get; set; }
+        public long FileSize { get; set; }
+        public int CurrentChunkIndex { get; set; }
+        public int TotalChunks { get; set; }
+        public double ProgressPercentage => TotalChunks > 0 ? Math.Min(100.0, CurrentChunkIndex * 100.0 / TotalChunks) : 0.0;
+        public TransferStatus Status { get; set; }
+        public string SavedFilePath { get; set; }
+        public DateTime StartedTime { get; set; }
+        public DateTime ExpireTimeUtc { get; set; }
+
+        /// <summary>
+        /// 30분 유효시간이 만료되었는지 여부
+        /// </summary>
+        public bool IsExpired => ExpireTimeUtc != DateTime.MinValue && DateTime.UtcNow > ExpireTimeUtc;
+
+        /// <summary>
+        /// 남은 유효시간 (TimeSpan)
+        /// </summary>
+        public TimeSpan RemainingValidTime
+        {
+            get
+            {
+                if (ExpireTimeUtc == DateTime.MinValue) return TimeSpan.Zero;
+                var rem = ExpireTimeUtc - DateTime.UtcNow;
+                return rem.TotalSeconds > 0 ? rem : TimeSpan.Zero;
+            }
+        }
+
+        /// <summary>
+        /// 남은 유효시간 표시 문자열 (예: "29:45 남음", "전송완료", "00:00 (만료됨)")
+        /// </summary>
+        public string RemainingValidTimeText
+        {
+            get
+            {
+                if (Status == TransferStatus.Completed) return "전송완료";
+                if (Status == TransferStatus.FileMissing) return "파일없음";
+                if (Status == TransferStatus.Cancelled) return "취소됨";
+                if (ExpireTimeUtc == DateTime.MinValue) return "확인중";
+                if (IsExpired) return "00:00 (만료됨)";
+                var rem = RemainingValidTime;
+                return $"{(int)rem.TotalMinutes:D2}:{rem.Seconds:D2} 남음";
+            }
+        }
+
+        /// <summary>
+        /// 다운로드 완료된 파일이 디스크에서 삭제/이동되었는지 및 유효시간이 만료되었는지 최신 상태로 갱신합니다.
+        /// </summary>
+        public void RefreshStatus()
+        {
+            // 1. 완료된 파일이 로컬 디스크에서 사라졌으면 '파일없음(FileMissing)' 상태로 변경
+            if (Status == TransferStatus.Completed && !string.IsNullOrEmpty(SavedFilePath))
+            {
+                if (!File.Exists(SavedFilePath))
+                {
+                    Status = TransferStatus.FileMissing;
+                }
+            }
+
+            // 2. 완료/취소되지 않은 상태에서 유효시간(30분)이 지났으면 'Expired' 표시
+            if (Status != TransferStatus.Completed && Status != TransferStatus.FileMissing &&
+                Status != TransferStatus.Cancelled && Status != TransferStatus.Transferring &&
+                IsExpired)
+            {
+                Status = TransferStatus.Expired;
+            }
+        }
+
+        internal NetworkStream Stream { get; set; }
+        internal SemaphoreSlim WriteLock { get; } = new SemaphoreSlim(1, 1);
+        internal CancellationTokenSource Cts { get; set; }
+        internal bool IsPaused { get; set; }
+        internal bool IsCancelled { get; set; }
+    }
+
+    /// <summary>
+    /// P2P 수신자(클라이언트) 자동 리스트 관리 모듈
+    /// - StartDownloadAsync()를 호출할 때마다 P2PReceiverItem 객체가 생성되어 내부 리스트(_receiverMap)에 자동 등록됩니다.
+    /// - GetReceiverList()로 수신 목록을 조회하면 각 파일의 상태(Status), 진행률(%), 남은 유효시간(RemainingValidTimeText), 완료 파일 삭제 여부(FileMissing)를 즉시 확인할 수 있습니다.
     /// </summary>
     public class P2PReceiverNode : IDisposable
     {
-        public string PeerId { get; }
-        public string PeerName { get; set; }
-
-        private string _downloadFolder;
         /// <summary>
-        /// 다운로드 받을 폴더 경로
+        /// 어디서든 접근 가능한 글로벌 수신 매니저 싱글톤 인스턴스
         /// </summary>
-        public string DownloadFolder
+        public static P2PReceiverNode Instance { get; } = new P2PReceiverNode();
+
+        // 여러 개의 수신 작업(Receiver)을 자동으로 관리하는 스레드 안전 컬렉션 (Key: "{peerId}_{chId}_{msgId}")
+        private readonly ConcurrentDictionary<string, P2PReceiverItem> _receiverMap = new ConcurrentDictionary<string, P2PReceiverItem>();
+
+        /// <summary>
+        /// [수신 파일 목록 조회 1]
+        /// 현재 등록되어 관리 중인 모든 Receiver 목록을 리스트로 반환합니다.
+        /// 조회 시 자동으로 완료된 파일의 디스크 존재 여부('파일없음')와 유효시간(30분) 만료 상태를 최신으로 갱신하여 반환합니다.
+        /// (chId를 지정하면 해당 채널의 수신 목록만 필터링 가능)
+        /// </summary>
+        public List<P2PReceiverItem> GetReceiverList(string chId = null)
         {
-            get => _downloadFolder;
-            set
+            var list = _receiverMap.Values.OrderBy(x => x.StartedTime).ToList();
+            foreach (var item in list)
             {
-                _downloadFolder = value;
-                if (!string.IsNullOrWhiteSpace(_downloadFolder) && !Directory.Exists(_downloadFolder))
-                {
-                    try { Directory.CreateDirectory(_downloadFolder); } catch { }
-                }
+                item.RefreshStatus();
             }
-        }
 
-        // 등록된 파일 전송 공지 목록 (Key: TransferId)
-        private readonly ConcurrentDictionary<string, TransferOffer> _receivedOffers = new ConcurrentDictionary<string, TransferOffer>();
-
-        // 사용자가 수락한 TransferId 목록 (재접속 시 이어받기 판단용)
-        private readonly ConcurrentDictionary<string, bool> _acceptedOffers = new ConcurrentDictionary<string, bool>();
-
-        // 취소/일시정지 상태 추적 (Key: TransferId)
-        private readonly ConcurrentDictionary<string, bool> _cancelledOffers = new ConcurrentDictionary<string, bool>();
-        private readonly ConcurrentDictionary<string, bool> _pausedOffers = new ConcurrentDictionary<string, bool>();
-
-        // 완료된 파일 경로 추적 (Key: FileId, Value: SavedFilePath)
-        private readonly ConcurrentDictionary<string, string> _completedFiles = new ConcurrentDictionary<string, string>();
-
-        // 현재 실행 중인 P2P 다운로드 연결 컨텍스트 (Key: TransferId)
-        private readonly ConcurrentDictionary<string, ActiveDownloadContext> _activeDownloads = new ConcurrentDictionary<string, ActiveDownloadContext>();
-
-        // 다중 파일 순차 다운로드 보장을 위한 세마포어
-        private readonly SemaphoreSlim _sequentialDownloadSemaphore = new SemaphoreSlim(1, 1);
-
-        public event EventHandler<TransferProgressEventArgs> TransferProgressUpdated;
-
-        private class ActiveDownloadContext
-        {
-            public string TransferId { get; set; }
-            public string CurrentFileId { get; set; }
-            public int CurrentChunkIndex { get; set; }
-            public NetworkStream Stream { get; set; }
-            public SemaphoreSlim WriteLock { get; } = new SemaphoreSlim(1, 1);
-            public CancellationTokenSource Cts { get; set; }
-        }
-
-        public P2PReceiverNode(string peerId, string peerName, string defaultDownloadFolder = null)
-        {
-            PeerId = string.IsNullOrWhiteSpace(peerId) ? Guid.NewGuid().ToString("N") : peerId;
-            PeerName = string.IsNullOrWhiteSpace(peerName) ? PeerId : peerName;
-            DownloadFolder = string.IsNullOrWhiteSpace(defaultDownloadFolder)
-                ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Downloads", PeerName)
-                : defaultDownloadFolder;
+            if (!string.IsNullOrWhiteSpace(chId))
+            {
+                list = list.Where(x => x.ChId == chId.Trim()).ToList();
+            }
+            return list;
         }
 
         /// <summary>
-        /// 채팅에서 최초 "파일 보낼 것이 있다(파일명/크기)"고 받았을 때 P2P 엔진에 해당 메타데이터를 등록합니다.
-        /// 등록 즉시 30분 유효시간 카운트가 관리되며 초기 상태(PendingAccept) 이벤트가 발생합니다.
+        /// [수신 파일 목록 조회 2]
+        /// 현재 전송(또는 대기/일시정지) 진행 중인 활성 Receiver 목록만 리스트로 반환합니다.
         /// </summary>
-        public void RegisterTransferOffer(TransferOffer offer)
+        public List<P2PReceiverItem> GetActiveReceiverList(string chId = null)
         {
-            if (offer == null || string.IsNullOrEmpty(offer.TransferId)) return;
-
-            int defaultChunkSize = offer.ChunkSize > 0 ? offer.ChunkSize : 64 * 1024;
-            foreach (var f in offer.Files)
-            {
-                if (f.ChunkSize <= 0) f.ChunkSize = defaultChunkSize;
-                if (f.TotalChunks <= 0)
-                {
-                    int tc = (int)((f.FileSize + f.ChunkSize - 1) / f.ChunkSize);
-                    f.TotalChunks = tc == 0 ? 1 : tc;
-                }
-            }
-
-            _receivedOffers[offer.TransferId] = offer;
-
-            foreach (var f in offer.Files)
-            {
-                int savedChunk = ReadSavedChunkProgress(offer.TransferId, f.FileId);
-                RaiseProgress(offer.TransferId, f.FileId, f.FileName, savedChunk, f.TotalChunks, f.ChunkSize, f.FileSize,
-                    TransferStatus.PendingAccept, "수신 수락 대기 중 (30분 유효)", null);
-            }
+            return GetReceiverList(chId)
+                .Where(x => x.Status == TransferStatus.WaitingQueue || x.Status == TransferStatus.Transferring || x.Status == TransferStatus.Paused || x.Status == TransferStatus.Merging)
+                .ToList();
         }
 
         /// <summary>
-        /// 수신자가 P2P 연결(수신 시작)을 누르기 전에 송신자가 채팅 메시지로 송신 취소를 알려왔을 때 호출합니다.
+        /// 완료되었거나 취소된 Receiver 항목들을 목록에서 정리합니다.
         /// </summary>
-        public void NotifyCancelledBySenderBeforeConnection(string transferId)
+        public void RemoveFinishedReceivers()
         {
-            HandleCancelledBySender(transferId);
-        }
-
-        /// <summary>
-        /// 수신자가 수신 수락(또는 이어받기)을 실행합니다.
-        /// 30분 유효시간 이내인지 확인한 후, 송신자의 P2P 포트로 직접 접속하여 조각 번호(RequestChunk) 요청을 시작합니다.
-        /// </summary>
-        public Task<bool> StartOrResumeTransferAsync(string transferId, string senderIp = null, int p2pPort = 0)
-        {
-            if (!_receivedOffers.TryGetValue(transferId, out var offer))
-                return Task.FromResult(false);
-
-            if (!string.IsNullOrWhiteSpace(senderIp))
-                offer.SenderIp = senderIp;
-            if (p2pPort > 0)
-                offer.P2PPort = p2pPort;
-
-            // 30분 유효시간 체크
-            if (offer.IsExpired)
+            foreach (var kv in _receiverMap.ToList())
             {
-                foreach (var f in offer.Files)
+                kv.Value.RefreshStatus();
+                if (kv.Value.Status == TransferStatus.Completed || kv.Value.Status == TransferStatus.Cancelled ||
+                    kv.Value.Status == TransferStatus.Expired || kv.Value.Status == TransferStatus.FileMissing)
                 {
-                    RaiseProgress(transferId, f.FileId, f.FileName, 0, f.TotalChunks, f.ChunkSize, f.FileSize,
-                        TransferStatus.Expired, "유효시간(30분) 경과로 전송 무효화됨", null);
-                }
-                return Task.FromResult(false);
-            }
-
-            _cancelledOffers.TryRemove(transferId, out _);
-
-            // 만약 현재 일시정지(Paused) 중이고 소켓 세션이 살아있다면 즉시 Resume 제어 명령을 보냄
-            if (_pausedOffers.TryRemove(transferId, out _) && _activeDownloads.TryGetValue(transferId, out var activeCtx) && activeCtx.Stream != null)
-            {
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await activeCtx.WriteLock.WaitAsync().ConfigureAwait(false);
-                        try
-                        {
-                            await FrameStreamHelper.WriteControlFrameAsync(activeCtx.Stream, P2PCommand.Resume, activeCtx.CurrentChunkIndex, null, CancellationToken.None).ConfigureAwait(false);
-                        }
-                        finally
-                        {
-                            activeCtx.WriteLock.Release();
-                        }
-                    }
-                    catch { }
-                });
-                return Task.FromResult(true);
-            }
-
-            _acceptedOffers[transferId] = true;
-
-            // 이미 다운로드 작업이 돌고 있지 않다면 P2P 순차 다운로드 태스크 시작
-            if (!_activeDownloads.ContainsKey(transferId))
-            {
-                _ = Task.Run(() => RunSequentialDownloadAsync(offer));
-            }
-
-            return Task.FromResult(true);
-        }
-
-        /// <summary>
-        /// 진행 중인 P2P 전송을 일시정지(Pause 제어 명령 전송)합니다.
-        /// </summary>
-        public async Task PauseTransferAsync(string transferId)
-        {
-            _pausedOffers[transferId] = true;
-
-            if (_activeDownloads.TryGetValue(transferId, out var ctx) && ctx.Stream != null)
-            {
-                try
-                {
-                    await ctx.WriteLock.WaitAsync().ConfigureAwait(false);
-                    try
-                    {
-                        await FrameStreamHelper.WriteControlFrameAsync(ctx.Stream, P2PCommand.Pause, ctx.CurrentChunkIndex, null, CancellationToken.None).ConfigureAwait(false);
-                    }
-                    finally
-                    {
-                        ctx.WriteLock.Release();
-                    }
-                }
-                catch { }
-
-                if (_receivedOffers.TryGetValue(transferId, out var offer))
-                {
-                    var f = offer.Files.FirstOrDefault(x => x.FileId == ctx.CurrentFileId) ?? offer.Files.FirstOrDefault();
-                    if (f != null)
-                    {
-                        RaiseProgress(transferId, f.FileId, f.FileName, ctx.CurrentChunkIndex, f.TotalChunks, f.ChunkSize, f.FileSize,
-                            TransferStatus.Paused, $"일시정지됨 ({ctx.CurrentChunkIndex}/{f.TotalChunks} 패킷 보관됨 - 이어받기 가능)", null);
-                    }
+                    _receiverMap.TryRemove(kv.Key, out _);
                 }
             }
         }
 
         /// <summary>
-        /// 수신자가 P2P 제어 명령(Cancel)을 통해 전송을 취소하고 임시 조각 파일을 삭제합니다.
+        /// 단순 로그 출력 이벤트
         /// </summary>
-        public async Task CancelTransferAsync(string transferId)
-        {
-            _cancelledOffers[transferId] = true;
-            _acceptedOffers.TryRemove(transferId, out _);
-            _pausedOffers.TryRemove(transferId, out _);
-
-            if (_activeDownloads.TryGetValue(transferId, out var ctx))
-            {
-                if (ctx.Stream != null)
-                {
-                    try
-                    {
-                        await ctx.WriteLock.WaitAsync().ConfigureAwait(false);
-                        try
-                        {
-                            await FrameStreamHelper.WriteControlFrameAsync(ctx.Stream, P2PCommand.Cancel, ctx.CurrentChunkIndex, null, CancellationToken.None).ConfigureAwait(false);
-                        }
-                        finally
-                        {
-                            ctx.WriteLock.Release();
-                        }
-                    }
-                    catch { }
-                }
-                try { ctx.Cts?.Cancel(); } catch { }
-            }
-
-            if (_receivedOffers.TryGetValue(transferId, out var offer))
-            {
-                foreach (var f in offer.Files)
-                {
-                    CleanupTempFiles(GetPartFilePath(transferId, f.FileId), GetIdxFilePath(transferId, f.FileId));
-                    RaiseProgress(transferId, f.FileId, f.FileName, 0, f.TotalChunks, f.ChunkSize, f.FileSize,
-                        TransferStatus.Cancelled, "수신 취소됨", null);
-                }
-            }
-        }
+        public event Action<string> OnLog;
 
         /// <summary>
-        /// 송신자 재접속 시 미완료(오류/네트워크 끊김) 상태였던 전송 건들을 자동으로 이어받기합니다.
+        /// 진행 상태 및 완료/취소/오류 이벤트 (WaitingQueue, Transferring, Paused, Merging, Completed, Cancelled, Expired, Error, FileMissing)
         /// </summary>
-        public async Task AutoResumeIncompleteTransfersAsync(string senderIp = null, int p2pPort = 0)
-        {
-            foreach (var kv in _acceptedOffers)
-            {
-                string transferId = kv.Key;
-                if (_cancelledOffers.ContainsKey(transferId) || _pausedOffers.ContainsKey(transferId)) continue;
-                if (_activeDownloads.ContainsKey(transferId)) continue;
-
-                if (_receivedOffers.TryGetValue(transferId, out var offer) && !offer.IsExpired)
-                {
-                    bool hasIncomplete = offer.Files.Any(f => !_completedFiles.ContainsKey(f.FileId));
-                    if (hasIncomplete)
-                    {
-                        await StartOrResumeTransferAsync(transferId, senderIp, p2pPort).ConfigureAwait(false);
-                    }
-                }
-            }
-        }
+        public event EventHandler<TransferProgressEventArgs> OnProgress;
 
         /// <summary>
-        /// 외부에서 송신자 네트워크 끊김을 감지했을 때 호출하거나, P2P 스트림 단절 시 상태를 갱신합니다.
+        /// 새로운 수신 작업(P2PReceiverItem)을 리스트에 자동 추가하고 백그라운드에서 다운로드를 시작합니다.
+        /// (peerID:사번, peerName:이름, chID:채널ID, msgID:파일ID 전송)
         /// </summary>
-        public void NotifySenderOffline()
+        public Task<P2PReceiverItem> StartDownloadAsync(string serverIp, int serverPort, string peerId, string peerName, string chId, string msgId, string downloadFolder)
         {
-            foreach (var kv in _activeDownloads)
-            {
-                try { kv.Value.Cts?.Cancel(); } catch { }
-            }
+            if (string.IsNullOrWhiteSpace(serverIp)) serverIp = "127.0.0.1";
+            if (string.IsNullOrWhiteSpace(peerId)) peerId = "EMP_001";
+            if (string.IsNullOrWhiteSpace(peerName)) peerName = "홍길동";
+            if (string.IsNullOrWhiteSpace(chId)) chId = "DEFAULT_CH";
+            if (string.IsNullOrWhiteSpace(msgId))
+                throw new ArgumentException("요청할 파일ID(msgID)를 입력해야 합니다.");
 
-            foreach (var offer in _receivedOffers.Values)
+            if (string.IsNullOrWhiteSpace(downloadFolder))
+                downloadFolder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Downloads");
+
+            string taskKey = $"{peerId.Trim()}_{chId.Trim()}_{msgId.Trim()}";
+
+            // 이미 리스트에 존재하고 현재 활성 상태인 경우 확인
+            if (_receiverMap.TryGetValue(taskKey, out var existing))
             {
-                if (_cancelledOffers.ContainsKey(offer.TransferId)) continue;
-                foreach (var f in offer.Files)
+                if (existing.IsPaused && existing.Stream != null)
                 {
-                    if (_completedFiles.ContainsKey(f.FileId)) continue;
-
-                    int savedChunk = ReadSavedChunkProgress(offer.TransferId, f.FileId);
-                    RaiseProgress(offer.TransferId, f.FileId, f.FileName, savedChunk, f.TotalChunks, f.ChunkSize, f.FileSize,
-                        TransferStatus.SenderOffline, $"송신자 연결 끊김 ({savedChunk}/{f.TotalChunks} 패킷 저장됨 - 재접속 시 이어받기)", null);
+                    existing.IsPaused = false;
+                    existing.Status = TransferStatus.Transferring;
+                    _ = SendControlAsync(existing, P2PCommand.Resume, existing.CurrentChunkIndex);
+                    Log($"[수신 재개] 사번:{peerId}({peerName}), chID:'{chId}', msgID:'{msgId}' 일시정지 해제 -> 이어받기 재개");
+                    return Task.FromResult(existing);
+                }
+                else if (existing.Status == TransferStatus.WaitingQueue || existing.Status == TransferStatus.Transferring || existing.Status == TransferStatus.Merging)
+                {
+                    Log($"[알림] 사번:{peerId}({peerName}), chID:'{chId}', msgID:'{msgId}' 는 이미 수신 목록에서 진행 중입니다. (현재 활성 수신 수: {GetActiveReceiverList().Count}개)");
+                    return Task.FromResult(existing);
                 }
             }
-        }
 
-        private async Task RunSequentialDownloadAsync(TransferOffer offer)
-        {
-            var cts = new CancellationTokenSource();
-            var ctx = new ActiveDownloadContext
+            // 새 Receiver 아이템 생성 후 관리 리스트(_receiverMap)에 자동 등록
+            var newItem = new P2PReceiverItem
             {
-                TransferId = offer.TransferId,
-                Cts = cts
+                TaskKey = taskKey,
+                ServerIp = serverIp.Trim(),
+                ServerPort = serverPort,
+                PeerId = peerId.Trim(),
+                PeerName = peerName.Trim(),
+                ChId = chId.Trim(),
+                MsgId = msgId.Trim(),
+                Status = TransferStatus.WaitingQueue,
+                StartedTime = DateTime.Now,
+                ExpireTimeUtc = DateTime.UtcNow.AddMinutes(30), // 서버 응답 시 서버의 실제 ExpireTimeUtc로 업데이트됨
+                Cts = new CancellationTokenSource()
             };
-            _activeDownloads[offer.TransferId] = ctx;
-            CancellationToken ct = cts.Token;
 
-            await _sequentialDownloadSemaphore.WaitAsync(ct).ConfigureAwait(false);
-            try
+            _receiverMap[taskKey] = newItem;
+            Log($"[수신 목록 등록] 사번:{newItem.PeerId}({newItem.PeerName}), chID:'{newItem.ChId}', msgID:'{newItem.MsgId}' 리스트 추가됨 (총 관리 목록:{_receiverMap.Count}개)");
+
+            // 백그라운드 스레드에서 비동기 다운로드 시작 (UI 블로킹 없음)
+            _ = Task.Run(() => RunDownloadSessionAsync(newItem, downloadFolder));
+            return Task.FromResult(newItem);
+        }
+
+        /// <summary>
+        /// 리스트에서 특정 채널ID(chId), 파일ID(msgId), 사번(peerId)의 다운로드를 일시정지(Pause)합니다.
+        /// </summary>
+        public void PauseDownload(string chId = null, string msgId = null, string peerId = null)
+        {
+            foreach (var item in _receiverMap.Values)
             {
-                foreach (var fileMeta in offer.Files)
+                if ((string.IsNullOrEmpty(chId) || item.ChId == chId) &&
+                    (string.IsNullOrEmpty(msgId) || item.MsgId == msgId) &&
+                    (string.IsNullOrEmpty(peerId) || item.PeerId == peerId) &&
+                    item.Status == TransferStatus.Transferring)
                 {
-                    ct.ThrowIfCancellationRequested();
-                    if (_cancelledOffers.ContainsKey(offer.TransferId))
-                        break;
-
-                    if (_completedFiles.TryGetValue(fileMeta.FileId, out string existingPath) && File.Exists(existingPath))
-                    {
-                        RaiseProgress(offer.TransferId, fileMeta.FileId, fileMeta.FileName, fileMeta.TotalChunks, fileMeta.TotalChunks,
-                            fileMeta.ChunkSize, fileMeta.FileSize, TransferStatus.Completed, "전송 완료", existingPath);
-                        continue;
-                    }
-
-                    ctx.CurrentFileId = fileMeta.FileId;
-                    await DownloadSingleFileOverP2PAsync(offer, fileMeta, ctx, ct).ConfigureAwait(false);
+                    item.IsPaused = true;
+                    item.Status = TransferStatus.Paused;
+                    _ = SendControlAsync(item, P2PCommand.Pause, item.CurrentChunkIndex);
+                    Log($"[일시정지] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' (패킷 {item.CurrentChunkIndex}/{item.TotalChunks} 저장됨)");
+                    RaiseProgress(item, 64 * 1024, TransferStatus.Paused, "일시정지됨", null);
                 }
-            }
-            catch (OperationCanceledException)
-            {
-                // 취소 또는 단절 처리 완료
-            }
-            catch
-            {
-                // 개별 파일 다운로드 내부에서 상태 이벤트 발생 완료
-            }
-            finally
-            {
-                _sequentialDownloadSemaphore.Release();
-                _activeDownloads.TryRemove(offer.TransferId, out _);
             }
         }
 
         /// <summary>
-        /// 단일 파일에 대해 P2P 소켓으로 접속하여:
-        /// 1) Handshake 제어 명령 전송
-        /// 2) WaitQueue / QueueReady 제어 명령 수신
-        /// 3) 기존 조각 이후 번호부터 RequestChunk(패킷 번호) 제어 명령 전송 -> DataChunk 패킷 수신 루프
-        /// 4) 복호화 + SHA-256 무결성 확인 후 파일 병합(Merge) 및 FileCompleted 제어 명령 전송
+        /// 리스트에서 일시정지된 다운로드를 재개(Resume)합니다.
         /// </summary>
-        private async Task DownloadSingleFileOverP2PAsync(TransferOffer offer, FileItemMeta fileMeta, ActiveDownloadContext ctx, CancellationToken ct)
+        public void ResumeDownload(string chId = null, string msgId = null, string peerId = null)
         {
-            if (!Directory.Exists(DownloadFolder))
+            foreach (var item in _receiverMap.Values)
             {
-                Directory.CreateDirectory(DownloadFolder);
+                if ((string.IsNullOrEmpty(chId) || item.ChId == chId) &&
+                    (string.IsNullOrEmpty(msgId) || item.MsgId == msgId) &&
+                    (string.IsNullOrEmpty(peerId) || item.PeerId == peerId) &&
+                    item.IsPaused)
+                {
+                    item.IsPaused = false;
+                    item.Status = TransferStatus.Transferring;
+                    _ = SendControlAsync(item, P2PCommand.Resume, item.CurrentChunkIndex);
+                    Log($"[재개 요청] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' (패킷 {item.CurrentChunkIndex}번부터 재개)");
+                    RaiseProgress(item, 64 * 1024, TransferStatus.Transferring, "전송 재개됨", null);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 리스트에서 특정 채널ID(chId), 파일ID(msgId), 사번(peerId)의 다운로드를 취소(Cancel)합니다.
+        /// </summary>
+        public void CancelDownload(string chId = null, string msgId = null, string peerId = null)
+        {
+            foreach (var item in _receiverMap.Values)
+            {
+                if ((string.IsNullOrEmpty(chId) || item.ChId == chId) &&
+                    (string.IsNullOrEmpty(msgId) || item.MsgId == msgId) &&
+                    (string.IsNullOrEmpty(peerId) || item.PeerId == peerId) &&
+                    (item.Status == TransferStatus.WaitingQueue || item.Status == TransferStatus.Transferring || item.Status == TransferStatus.Paused))
+                {
+                    item.IsCancelled = true;
+                    item.Status = TransferStatus.Cancelled;
+                    try
+                    {
+                        SendControlAsync(item, P2PCommand.Cancel, item.CurrentChunkIndex).Wait(100);
+                    }
+                    catch { }
+                    try { item.Cts?.Cancel(); } catch { }
+                    Log($"[수신 취소 요청] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' 취소 처리됨.");
+                }
+            }
+        }
+
+        private async Task RunDownloadSessionAsync(P2PReceiverItem item, string downloadFolder)
+        {
+            if (!Directory.Exists(downloadFolder))
+            {
+                Directory.CreateDirectory(downloadFolder);
             }
 
-            string partFilePath = GetPartFilePath(offer.TransferId, fileMeta.FileId);
-            string idxFilePath = GetIdxFilePath(offer.TransferId, fileMeta.FileId);
-            string finalFilePath = Path.Combine(DownloadFolder, fileMeta.FileName);
+            CancellationToken ct = item.Cts.Token;
+            string partFilePath = Path.Combine(downloadFolder, $".p2p_{item.PeerId}_{item.ChId}_{item.MsgId}.part");
+            string idxFilePath = Path.Combine(downloadFolder, $".p2p_{item.PeerId}_{item.ChId}_{item.MsgId}.idx");
+            int chunkSize = 64 * 1024;
 
-            // 기존에 받은 패킷(조각) 번호 확인 (이어받기)
-            int startChunk = ReadSavedChunkProgress(offer.TransferId, fileMeta.FileId);
-            long expectedPartLength = (long)startChunk * fileMeta.ChunkSize;
-
-            if (startChunk > 0 && (!File.Exists(partFilePath) || new FileInfo(partFilePath).Length < expectedPartLength))
+            using (var client = new TcpClient())
             {
-                startChunk = 0;
-                SaveChunkProgress(idxFilePath, 0);
-            }
-
-            ctx.CurrentChunkIndex = startChunk;
-
-            using (var p2pClient = new TcpClient())
-            {
-                p2pClient.NoDelay = true;
+                client.NoDelay = true;
                 try
                 {
-                    await p2pClient.ConnectAsync(offer.SenderIp ?? "127.0.0.1", offer.P2PPort).ConfigureAwait(false);
-                    NetworkStream stream = p2pClient.GetStream();
-                    ctx.Stream = stream;
+                    // 기존에 받은 패킷 번호 확인 (이어받기)
+                    int startChunk = ReadSavedChunkIndex(idxFilePath);
 
-                    // 1. Handshake 제어 명령 전송 (헤더 ChunkIndex에 시작 조각 번호 포함)
-                    var handshake = new HandshakePayload
+                    Log($"[연결 시도] 서버({item.ServerIp}:{item.ServerPort}) 접속 중... (사번:{item.PeerId}, 이름:{item.PeerName}, chID:{item.ChId}, msgID:{item.MsgId})");
+                    await client.ConnectAsync(item.ServerIp, item.ServerPort).ConfigureAwait(false);
+                    NetworkStream stream = client.GetStream();
+                    item.Stream = stream;
+
+                    // 1. Handshake 전송: peerID(사번), peerName(이름), chID(채널ID), msgID(파일ID) 및 시작 패킷 번호 전송
+                    var hsReq = new HandshakeRequest
                     {
-                        TransferId = offer.TransferId,
-                        FileId = fileMeta.FileId,
-                        PeerId = PeerId,
-                        PeerName = PeerName
+                        PeerId = item.PeerId,
+                        PeerName = item.PeerName,
+                        ChId = item.ChId,
+                        MsgId = item.MsgId
                     };
-                    string hsJson = FrameStreamHelper.SerializeJson(handshake);
-                    await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Handshake, startChunk, hsJson, ct).ConfigureAwait(false);
+                    await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Handshake, startChunk, FrameStreamHelper.SerializeJson(hsReq), ct).ConfigureAwait(false);
 
-                    // 2. 송신자로부터 대기열(WaitQueue) 또는 시작 준비(QueueReady) 제어 명령 수신
+                    // 2. 서버로부터 파일 메타데이터(HandshakeAck) 또는 Error 수신
+                    P2PFrame ackFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
+                    if (ackFrame == null)
+                        throw new IOException("서버로부터 응답이 없습니다.");
+
+                    if (ackFrame.Command == P2PCommand.Error)
+                    {
+                        string errMsg = ackFrame.GetPayloadText();
+                        bool isExpired = errMsg.StartsWith("EXPIRED:");
+                        item.Status = isExpired ? TransferStatus.Expired : TransferStatus.Error;
+                        if (isExpired) item.ExpireTimeUtc = DateTime.UtcNow.AddSeconds(-1);
+                        Log($"[서버 거부] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' -> {errMsg}");
+                        RaiseProgress(item, chunkSize, item.Status, errMsg, null);
+                        return;
+                    }
+
+                    if (ackFrame.Command != P2PCommand.HandshakeAck)
+                    {
+                        item.Status = TransferStatus.Error;
+                        Log($"[프로토콜 오류] 예상치 못한 응답({ackFrame.Command})");
+                        RaiseProgress(item, chunkSize, TransferStatus.Error, "프로토콜 응답 오류", null);
+                        return;
+                    }
+
+                    var fileMeta = FrameStreamHelper.DeserializeJson<HandshakeResponse>(ackFrame.GetPayloadText());
+                    if (fileMeta == null) return;
+
+                    item.FileName = fileMeta.FileName;
+                    item.FileSize = fileMeta.FileSize;
+                    item.TotalChunks = fileMeta.TotalChunks;
+                    if (fileMeta.ExpireUtcTicks > 0)
+                    {
+                        item.ExpireTimeUtc = new DateTime(fileMeta.ExpireUtcTicks, DateTimeKind.Utc);
+                    }
+                    chunkSize = fileMeta.ChunkSize > 0 ? fileMeta.ChunkSize : 64 * 1024;
+
+                    // 임시 파일(.part) 유효성 확인 (마지막 패킷이 64KB 미만일 수 있으므로 Math.Min으로 실제 기대 바이트 계산)
+                    if (startChunk > fileMeta.TotalChunks)
+                    {
+                        startChunk = 0;
+                        SaveChunkIndex(idxFilePath, 0);
+                    }
+                    long expectedPartSize = Math.Min(fileMeta.FileSize, (long)startChunk * chunkSize);
+                    if (startChunk > 0 && (!File.Exists(partFilePath) || new FileInfo(partFilePath).Length < expectedPartSize))
+                    {
+                        startChunk = 0;
+                        SaveChunkIndex(idxFilePath, 0);
+                    }
+                    item.CurrentChunkIndex = startChunk;
+
+                    Log($"[파일 확인] chID:'{item.ChId}', msgID:'{item.MsgId}' -> 파일명:'{item.FileName}', 크기:{P2PSenderNode.FormatBytes(item.FileSize)}, 총 {item.TotalChunks}패킷 (유효시간:{item.RemainingValidTimeText}, 시작패킷:{startChunk}번)");
+
+                    // 3. 대기열(WaitQueue) 또는 시작 승인(QueueReady) 수신 대기
                     while (true)
                     {
-                        P2PFrame ctrlFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
-                        if (ctrlFrame == null)
-                            throw new IOException("송신자 P2P 연결이 끊어졌습니다.");
+                        P2PFrame qFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
+                        if (qFrame == null)
+                            throw new IOException("대기 중 서버 연결이 끊어졌습니다.");
 
-                        if (ctrlFrame.Command == P2PCommand.WaitQueue)
+                        if (qFrame.Command == P2PCommand.WaitQueue)
                         {
-                            RaiseProgress(offer.TransferId, fileMeta.FileId, fileMeta.FileName, startChunk, fileMeta.TotalChunks,
-                                fileMeta.ChunkSize, fileMeta.FileSize, TransferStatus.WaitingQueue, "수신 대기 중 (송신자 동시 전송 제한 대기열)", null);
+                            item.Status = TransferStatus.WaitingQueue;
+                            Log($"[수신 대기중] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' ({item.FileName}) - 서버 동시 전송 제한 대기열 대기 중...");
+                            RaiseProgress(item, chunkSize, TransferStatus.WaitingQueue, "동시 전송 제한 대기 중", null);
                             continue;
                         }
-                        else if (ctrlFrame.Command == P2PCommand.QueueReady)
+                        else if (qFrame.Command == P2PCommand.QueueReady)
                         {
+                            item.Status = TransferStatus.Transferring;
+                            Log($"[수신 시작] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' ({item.FileName}) 패킷 요청을 시작합니다.");
                             break;
                         }
-                        else if (ctrlFrame.Command == P2PCommand.Cancel)
+                        else if (qFrame.Command == P2PCommand.Cancel)
                         {
-                            HandleCancelledBySender(offer.TransferId);
-                            return;
+                            item.IsCancelled = true;
+                            throw new OperationCanceledException("서버에 의해 취소됨");
                         }
-                        else if (ctrlFrame.Command == P2PCommand.Error)
+                        else if (qFrame.Command == P2PCommand.Error)
                         {
-                            string reason = ctrlFrame.GetPayloadText();
-                            TransferStatus st = reason == "EXPIRED" ? TransferStatus.Expired : TransferStatus.Error;
-                            RaiseProgress(offer.TransferId, fileMeta.FileId, fileMeta.FileName, startChunk, fileMeta.TotalChunks,
-                                fileMeta.ChunkSize, fileMeta.FileSize, st, $"전송 거부됨 ({reason})", null);
+                            string err = qFrame.GetPayloadText();
+                            item.Status = TransferStatus.Error;
+                            Log($"[오류] {err}");
+                            RaiseProgress(item, chunkSize, TransferStatus.Error, err, null);
                             return;
-                        }
-                        else if (ctrlFrame.Command == P2PCommand.Disconnect)
-                        {
-                            throw new IOException("송신자 네트워크가 종료되었습니다.");
                         }
                     }
 
-                    // 3. 조각 번호(RequestChunk) 요청 및 DataChunk 수신 루프
+                    // 4. 한 패킷씩 번호(RequestChunk)를 요청하고 DataChunk를 수신하여 복호화 및 SHA-256 검증
                     using (var partFs = new FileStream(partFilePath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None))
                     {
-                        partFs.Seek((long)startChunk * fileMeta.ChunkSize, SeekOrigin.Begin);
+                        partFs.Seek((long)startChunk * chunkSize, SeekOrigin.Begin);
 
-                        for (int chunkIdx = startChunk; chunkIdx < fileMeta.TotalChunks; chunkIdx++)
+                        for (int chunkIdx = startChunk; chunkIdx < item.TotalChunks; chunkIdx++)
                         {
                             ct.ThrowIfCancellationRequested();
 
-                            // 수신자 측에서 일시정지(Pause)를 누른 경우 재개될 때까지 대기
-                            while (_pausedOffers.ContainsKey(offer.TransferId) && !ct.IsCancellationRequested && !_cancelledOffers.ContainsKey(offer.TransferId))
+                            while (item.IsPaused && !ct.IsCancellationRequested && !item.IsCancelled)
                             {
                                 await Task.Delay(100, ct).ConfigureAwait(false);
                             }
 
-                            if (_cancelledOffers.ContainsKey(offer.TransferId))
+                            if (item.IsCancelled)
                                 throw new OperationCanceledException();
 
-                            ctx.CurrentChunkIndex = chunkIdx;
+                            item.CurrentChunkIndex = chunkIdx;
 
-                            // 3-1. 송신자에게 "chunkIdx번 패킷을 달라"고 RequestChunk 제어 명령 전송
-                            await ctx.WriteLock.WaitAsync(ct).ConfigureAwait(false);
-                            try
-                            {
-                                await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.RequestChunk, chunkIdx, null, ct).ConfigureAwait(false);
-                            }
-                            finally
-                            {
-                                ctx.WriteLock.Release();
-                            }
+                            // 4-1. 송신자에게 chunkIdx번 패킷 요청
+                            await SendControlAsync(item, P2PCommand.RequestChunk, chunkIdx).ConfigureAwait(false);
 
-                            // 3-2. 송신자로부터 패킷 수신 (DataChunk 패킷 또는 중간에 끼어든 Pause/Cancel/Disconnect 제어 명령)
-                            P2PFrame responseFrame = null;
+                            // 4-2. 송신자로부터 DataChunk (또는 제어 명령) 수신
+                            P2PFrame dataFrame = null;
                             while (true)
                             {
-                                responseFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
-                                if (responseFrame == null)
-                                    throw new IOException("패킷 수신 중 송신자 연결이 끊어졌습니다.");
+                                dataFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
+                                if (dataFrame == null)
+                                    throw new IOException("패킷 수신 중 서버 연결이 끊어졌습니다.");
 
-                                if (responseFrame.Command == P2PCommand.DataChunk)
+                                if (dataFrame.Command == P2PCommand.DataChunk)
                                 {
                                     break;
                                 }
-                                else if (responseFrame.Command == P2PCommand.Pause)
+                                else if (dataFrame.Command == P2PCommand.Cancel)
                                 {
-                                    _pausedOffers[offer.TransferId] = true;
-                                    RaiseProgress(offer.TransferId, fileMeta.FileId, fileMeta.FileName, chunkIdx, fileMeta.TotalChunks,
-                                        fileMeta.ChunkSize, fileMeta.FileSize, TransferStatus.Paused, $"송신자에 의해 일시정지됨 ({chunkIdx}/{fileMeta.TotalChunks} 패킷)", null);
+                                    item.IsCancelled = true;
+                                    throw new OperationCanceledException("송신자가 전송을 취소했습니다.");
                                 }
-                                else if (responseFrame.Command == P2PCommand.Resume)
+                                else if (dataFrame.Command == P2PCommand.Error)
                                 {
-                                    _pausedOffers.TryRemove(offer.TransferId, out _);
-                                    RaiseProgress(offer.TransferId, fileMeta.FileId, fileMeta.FileName, chunkIdx, fileMeta.TotalChunks,
-                                        fileMeta.ChunkSize, fileMeta.FileSize, TransferStatus.Transferring, $"송신자에 의해 재개됨 ({chunkIdx}/{fileMeta.TotalChunks} 패킷~)", null);
-                                }
-                                else if (responseFrame.Command == P2PCommand.Cancel)
-                                {
-                                    HandleCancelledBySender(offer.TransferId);
-                                    return;
-                                }
-                                else if (responseFrame.Command == P2PCommand.Disconnect)
-                                {
-                                    throw new IOException("송신자 네트워크가 끊어졌습니다.");
-                                }
-                                else if (responseFrame.Command == P2PCommand.Error)
-                                {
-                                    throw new IOException("송신자 오류 응답: " + responseFrame.GetPayloadText());
+                                    throw new IOException("서버 오류: " + dataFrame.GetPayloadText());
                                 }
                             }
 
-                            byte[] encryptedPayload = responseFrame.Payload ?? new byte[0];
+                            byte[] encrypted = dataFrame.Payload ?? new byte[0];
 
-                            // 복호화
-                            byte[] decryptedChunk = ChunkSecurityHelper.TransformChunk(encryptedPayload, encryptedPayload.Length, responseFrame.ChunkIndex);
-
-                            // 무결성 검증 (SHA-256)
-                            byte[] actualSha256 = ChunkSecurityHelper.ComputeSha256(decryptedChunk, 0, decryptedChunk.Length);
-                            if (!ChunkSecurityHelper.VerifyHash(responseFrame.Hash, actualSha256))
+                            // 복호화 및 SHA-256 무결성 검증
+                            byte[] decrypted = ChunkSecurityHelper.TransformChunk(encrypted, encrypted.Length, dataFrame.ChunkIndex);
+                            byte[] actualSha256 = ChunkSecurityHelper.ComputeSha256(decrypted, 0, decrypted.Length);
+                            if (!ChunkSecurityHelper.VerifyHash(dataFrame.Hash, actualSha256))
                             {
-                                throw new InvalidDataException($"패킷 #{responseFrame.ChunkIndex} 무결성 검증(SHA-256) 실패!");
+                                throw new InvalidDataException($"패킷 #{dataFrame.ChunkIndex} SHA-256 무결성 검증 실패!");
                             }
 
-                            // 디스크 기록 및 완료된 조각 번호 저장
-                            if (decryptedChunk.Length > 0)
+                            if (decrypted.Length > 0)
                             {
-                                await partFs.WriteAsync(decryptedChunk, 0, decryptedChunk.Length, ct).ConfigureAwait(false);
+                                await partFs.WriteAsync(decrypted, 0, decrypted.Length, ct).ConfigureAwait(false);
                             }
                             await partFs.FlushAsync(ct).ConfigureAwait(false);
 
-                            int completedChunkCount = chunkIdx + 1;
-                            ctx.CurrentChunkIndex = completedChunkCount;
-                            SaveChunkProgress(idxFilePath, completedChunkCount);
+                            int doneCount = chunkIdx + 1;
+                            item.CurrentChunkIndex = doneCount;
+                            item.Status = TransferStatus.Transferring;
+                            SaveChunkIndex(idxFilePath, doneCount);
 
-                            // 패킷 크기(fileMeta.ChunkSize)가 일정하므로 완료된 패킷 번호(completedChunkCount)로 진행 상태 계산
-                            string resumeTag = startChunk > 0 ? $" [이어받기:{startChunk}번~]" : "";
-                            RaiseProgress(offer.TransferId, fileMeta.FileId, fileMeta.FileName, completedChunkCount, fileMeta.TotalChunks,
-                                fileMeta.ChunkSize, fileMeta.FileSize, TransferStatus.Transferring,
-                                $"수신 중 ({completedChunkCount}/{fileMeta.TotalChunks} 패킷){resumeTag}", null);
+                            if (doneCount == 1 || doneCount == item.TotalChunks || doneCount % 5 == 0)
+                            {
+                                string resumeNote = startChunk > 0 ? $" [이어받기:{startChunk}번~]" : "";
+                                Log($"[패킷 수신] <- 사번:{item.PeerId}({item.PeerName}) | chID:{item.ChId} | msgID:{item.MsgId} ({item.FileName}) | 패킷 {doneCount}/{item.TotalChunks} ({item.ProgressPercentage:0.0}%){resumeNote}");
+                            }
+
+                            RaiseProgress(item, chunkSize, TransferStatus.Transferring, $"수신 중 ({doneCount}/{item.TotalChunks})", null);
                         }
                     }
 
-                    // 4. 파일 병합(Merge) 및 최종 확정
-                    RaiseProgress(offer.TransferId, fileMeta.FileId, fileMeta.FileName, fileMeta.TotalChunks, fileMeta.TotalChunks,
-                        fileMeta.ChunkSize, fileMeta.FileSize, TransferStatus.Merging, "무결성 확인 및 파일 병합 중...", null);
+                    // 5. 파일 병합(Merge) 및 완료 상태 알림
+                    item.Status = TransferStatus.Merging;
+                    RaiseProgress(item, chunkSize, TransferStatus.Merging, "파일 병합 중...", null);
 
+                    string finalFileName = $"{item.PeerId}_{item.ChId}_{item.MsgId}_{item.FileName}";
+                    string finalFilePath = Path.Combine(downloadFolder, finalFileName);
                     if (File.Exists(finalFilePath))
                     {
                         try { File.Delete(finalFilePath); } catch { }
@@ -546,135 +512,90 @@ namespace P2PTransferLib
                         try { File.Delete(idxFilePath); } catch { }
                     }
 
-                    _completedFiles[fileMeta.FileId] = finalFilePath;
+                    item.SavedFilePath = finalFilePath;
+                    item.Status = TransferStatus.Completed;
 
-                    // 송신자에게 FileCompleted 제어 명령 전송
-                    await ctx.WriteLock.WaitAsync(ct).ConfigureAwait(false);
-                    try
-                    {
-                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.FileCompleted, fileMeta.TotalChunks, null, ct).ConfigureAwait(false);
-                    }
-                    finally
-                    {
-                        ctx.WriteLock.Release();
-                    }
+                    // 송신자에게 완료(FileCompleted) 통보
+                    await SendControlAsync(item, P2PCommand.FileCompleted, item.TotalChunks).ConfigureAwait(false);
 
-                    RaiseProgress(offer.TransferId, fileMeta.FileId, fileMeta.FileName, fileMeta.TotalChunks, fileMeta.TotalChunks,
-                        fileMeta.ChunkSize, fileMeta.FileSize, TransferStatus.Completed, "수신 완료", finalFilePath);
+                    Log($"[수신 완료] 사번:{item.PeerId}({item.PeerName}) | chID:'{item.ChId}' | msgID:'{item.MsgId}' 병합 완료 -> 저장경로: {finalFilePath}");
+                    RaiseProgress(item, chunkSize, TransferStatus.Completed, "수신 완료", finalFilePath);
                 }
                 catch (OperationCanceledException)
                 {
-                    if (_cancelledOffers.ContainsKey(offer.TransferId))
+                    if (item.IsCancelled)
                     {
+                        item.Status = TransferStatus.Cancelled;
                         CleanupTempFiles(partFilePath, idxFilePath);
-                        RaiseProgress(offer.TransferId, fileMeta.FileId, fileMeta.FileName, 0, fileMeta.TotalChunks,
-                            fileMeta.ChunkSize, fileMeta.FileSize, TransferStatus.Cancelled, "전송 취소됨", null);
+                        Log($"[취소 완료] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' 임시 조각 파일 삭제됨.");
+                        RaiseProgress(item, chunkSize, TransferStatus.Cancelled, "취소됨", null);
                     }
                     else
                     {
-                        int saved = ReadSavedChunkProgress(offer.TransferId, fileMeta.FileId);
-                        RaiseProgress(offer.TransferId, fileMeta.FileId, fileMeta.FileName, saved, fileMeta.TotalChunks,
-                            fileMeta.ChunkSize, fileMeta.FileSize, TransferStatus.SenderOffline,
-                            $"전송 중단됨 ({saved}/{fileMeta.TotalChunks} 패킷 저장됨 - 이어받기 가능)", null);
+                        int saved = ReadSavedChunkIndex(idxFilePath);
+                        item.CurrentChunkIndex = saved;
+                        item.Status = TransferStatus.Error;
+                        Log($"[연결 중단] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' ({saved}번 패킷까지 보관됨 - 다시 수신 누르면 이어받기)");
+                        RaiseProgress(item, chunkSize, TransferStatus.Error, "연결 중단 (이어받기 대기)", null);
                     }
-                    throw;
                 }
                 catch (Exception ex)
                 {
-                    int saved = ReadSavedChunkProgress(offer.TransferId, fileMeta.FileId);
-                    RaiseProgress(offer.TransferId, fileMeta.FileId, fileMeta.FileName, saved, fileMeta.TotalChunks,
-                        fileMeta.ChunkSize, fileMeta.FileSize, TransferStatus.SenderOffline,
-                        $"연결/전송 오류: {ex.Message} ({saved}/{fileMeta.TotalChunks} 패킷 저장됨 - 재접속 시 이어받기)", null);
-                    throw;
-                }
-            }
-        }
-
-        private void HandleCancelledBySender(string transferId)
-        {
-            _cancelledOffers[transferId] = true;
-            _acceptedOffers.TryRemove(transferId, out _);
-            _pausedOffers.TryRemove(transferId, out _);
-
-            if (_activeDownloads.TryGetValue(transferId, out var ctx))
-            {
-                try { ctx.Cts?.Cancel(); } catch { }
-            }
-
-            if (_receivedOffers.TryGetValue(transferId, out var offer))
-            {
-                foreach (var f in offer.Files)
-                {
-                    CleanupTempFiles(GetPartFilePath(transferId, f.FileId), GetIdxFilePath(transferId, f.FileId));
-                    RaiseProgress(transferId, f.FileId, f.FileName, 0, f.TotalChunks, f.ChunkSize, f.FileSize,
-                        TransferStatus.Cancelled, "송신자에 의해 전송 취소됨", null);
-                }
-            }
-        }
-
-        /// <summary>
-        /// 다운로드 완료된 파일이 로컬 디스크에서 삭제되었는지('파일없음') 및 30분 유효시간 만료 여부를 검사합니다.
-        /// </summary>
-        public void CheckFilesAndExpirationStatus()
-        {
-            foreach (var offer in _receivedOffers.Values)
-            {
-                if (!_acceptedOffers.ContainsKey(offer.TransferId) && !_cancelledOffers.ContainsKey(offer.TransferId) && offer.IsExpired)
-                {
-                    foreach (var f in offer.Files)
+                    if (item.IsCancelled)
                     {
-                        RaiseProgress(offer.TransferId, f.FileId, f.FileName, 0, f.TotalChunks, f.ChunkSize, f.FileSize,
-                            TransferStatus.Expired, "유효시간(30분) 만료됨", null);
+                        item.Status = TransferStatus.Cancelled;
+                        CleanupTempFiles(partFilePath, idxFilePath);
+                        Log($"[취소 완료] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' 임시 조각 파일 삭제됨.");
+                        RaiseProgress(item, chunkSize, TransferStatus.Cancelled, "취소됨", null);
+                    }
+                    else
+                    {
+                        int saved = ReadSavedChunkIndex(idxFilePath);
+                        item.CurrentChunkIndex = saved;
+                        item.Status = TransferStatus.Error;
+                        Log($"[수신 오류] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' - {ex.Message} ({saved}번 패킷까지 보관됨 - 다시 수신 누르면 이어받기)");
+                        RaiseProgress(item, chunkSize, TransferStatus.Error, ex.Message, null);
                     }
                 }
-
-                foreach (var f in offer.Files)
+                finally
                 {
-                    if (_completedFiles.TryGetValue(f.FileId, out string savedPath))
-                    {
-                        if (!File.Exists(savedPath))
-                        {
-                            RaiseProgress(offer.TransferId, f.FileId, f.FileName, f.TotalChunks, f.TotalChunks,
-                                f.ChunkSize, f.FileSize, TransferStatus.FileMissing, "파일없음", savedPath);
-                        }
-                    }
+                    item.Stream = null;
                 }
             }
         }
 
-        private string GetPartFilePath(string transferId, string fileId)
+        private async Task SendControlAsync(P2PReceiverItem item, P2PCommand cmd, int chunkIndex)
         {
-            return Path.Combine(DownloadFolder, $".p2p_{transferId}_{fileId}.part");
+            if (item.Stream == null) return;
+            await item.WriteLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await FrameStreamHelper.WriteControlFrameAsync(item.Stream, cmd, chunkIndex, null, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch { }
+            finally
+            {
+                item.WriteLock.Release();
+            }
         }
 
-        private string GetIdxFilePath(string transferId, string fileId)
-        {
-            return Path.Combine(DownloadFolder, $".p2p_{transferId}_{fileId}.idx");
-        }
-
-        public int ReadSavedChunkProgress(string transferId, string fileId)
+        private int ReadSavedChunkIndex(string idxPath)
         {
             try
             {
-                string idxPath = GetIdxFilePath(transferId, fileId);
                 if (File.Exists(idxPath))
                 {
-                    string text = File.ReadAllText(idxPath).Trim();
-                    if (int.TryParse(text, out int idx) && idx >= 0)
-                        return idx;
+                    string txt = File.ReadAllText(idxPath).Trim();
+                    if (int.TryParse(txt, out int idx) && idx >= 0) return idx;
                 }
             }
             catch { }
             return 0;
         }
 
-        private void SaveChunkProgress(string idxFilePath, int completedChunks)
+        private void SaveChunkIndex(string idxPath, int completedChunks)
         {
-            try
-            {
-                File.WriteAllText(idxFilePath, completedChunks.ToString());
-            }
-            catch { }
+            try { File.WriteAllText(idxPath, completedChunks.ToString()); } catch { }
         }
 
         private void CleanupTempFiles(string partPath, string idxPath)
@@ -683,38 +604,41 @@ namespace P2PTransferLib
             try { if (File.Exists(idxPath)) File.Delete(idxPath); } catch { }
         }
 
-        private void RaiseProgress(string transferId, string fileId, string fileName,
-            int completedChunkCount, int totalChunks, int chunkSize, long totalBytes,
-            TransferStatus status, string message, string savedFilePath)
+        private void Log(string msg)
         {
-            // 패킷 크기(chunkSize)가 일정하므로 완료된 패킷 번호(completedChunkCount)로 전송 바이트 산출
-            long transferredBytes = Math.Min(totalBytes, (long)completedChunkCount * chunkSize);
+            OnLog?.Invoke($"[{DateTime.Now:HH:mm:ss.fff}] {msg}");
+        }
 
-            TransferProgressUpdated?.Invoke(this, new TransferProgressEventArgs
+        private void RaiseProgress(P2PReceiverItem item, int chunkSize, TransferStatus status, string message, string savedPath)
+        {
+            long transferred = Math.Min(item.FileSize, (long)item.CurrentChunkIndex * chunkSize);
+            OnProgress?.Invoke(this, new TransferProgressEventArgs
             {
-                TransferId = transferId,
-                FileId = fileId,
-                FileName = fileName,
-                PeerId = PeerId,
-                PeerName = PeerName,
-                CurrentChunkIndex = completedChunkCount,
-                TotalChunks = totalChunks,
+                SessionKey = item.TaskKey,
+                ChId = item.ChId,
+                MsgId = item.MsgId,
+                FileName = item.FileName ?? item.MsgId,
+                PeerId = item.PeerId,
+                PeerName = item.PeerName,
+                CurrentChunkIndex = item.CurrentChunkIndex,
+                TotalChunks = item.TotalChunks,
                 ChunkSize = chunkSize,
-                TransferredBytes = transferredBytes,
-                TotalBytes = totalBytes,
+                TransferredBytes = transferred,
+                TotalBytes = item.FileSize,
                 Status = status,
+                ExpireTimeUtc = item.ExpireTimeUtc,
                 Message = message,
-                SavedFilePath = savedFilePath
+                SavedFilePath = savedPath
             });
         }
 
         public void Dispose()
         {
-            foreach (var kv in _activeDownloads)
+            foreach (var kv in _receiverMap)
             {
                 try { kv.Value.Cts?.Cancel(); } catch { }
             }
-            _activeDownloads.Clear();
+            _receiverMap.Clear();
         }
     }
 }
