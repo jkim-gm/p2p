@@ -139,18 +139,16 @@ namespace P2PSampleApp
                 string sampleDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SampleFiles");
                 if (!Directory.Exists(sampleDir)) Directory.CreateDirectory(sampleDir);
 
-                string file1 = Path.Combine(sampleDir, "SampleData_1.bin");
-                string file2 = Path.Combine(sampleDir, "SampleData_2.bin");
-
-                // 2MB(32패킷), 1.5MB(24패킷) 테스트 파일 생성
-                CreateDummyFile(file1, 2 * 1024 * 1024);
-                CreateDummyFile(file2, 1536 * 1024);
-
                 string chId = TxtRegisterChId.Text.Trim();
-                TxtRegisterFilePath.Text = file1;
 
-                _sender.RegisterFile(chId, "MSG_1001", file1);
-                _sender.RegisterFile(chId, "MSG_1002", file2);
+                // 테스트용 더미 파일 5개(SampleData_1.bin ~ SampleData_5.bin) 생성 및 MSG_1001 ~ MSG_1005 등록
+                for (int i = 1; i <= 5; i++)
+                {
+                    string file = Path.Combine(sampleDir, $"SampleData_{i}.bin");
+                    CreateDummyFile(file, 1536 * 1024); // 각 1.5MB (24패킷)
+                    if (i == 1) TxtRegisterFilePath.Text = file;
+                    _sender.RegisterFile(chId, $"MSG_100{i}", file);
+                }
             }
             catch (Exception ex)
             {
@@ -225,7 +223,7 @@ namespace P2PSampleApp
 
         private void BtnTestMultiConcurrentReceive_Click(object sender, RoutedEventArgs e)
         {
-            if (!_sender.IsRunning)
+            if (!_sender.IsRunning || _sender.GetRegisteredFiles().Count < 5)
             {
                 BtnCreateDummyAndRegister_Click(null, null);
             }
@@ -235,12 +233,13 @@ namespace P2PSampleApp
             string chId = TxtRequestChId.Text.Trim();
             string folder = TxtDownloadFolder.Text.Trim();
 
-            // 5개의 Receiver가 리스트에 자동 추가되어 백그라운드로 동시 실행 (3개 즉시 전송, 2개 대기 후 전송)
+            // 5개의 파일(MSG_1001 ~ MSG_1005)을 같은 폴더에 원래 파일명(SampleData_1.bin ~ SampleData_5.bin) 그대로 동시 수신
+            // (동시제한 3개는 즉시 전송되고, 나머지 2개는 대기열 후 자동 전송됨)
             _ = _receiverManager.StartDownloadAsync(serverIp, serverPort, "EMP_2001", "홍길동", chId, "MSG_1001", folder);
             _ = _receiverManager.StartDownloadAsync(serverIp, serverPort, "EMP_2002", "김철수", chId, "MSG_1002", folder);
-            _ = _receiverManager.StartDownloadAsync(serverIp, serverPort, "EMP_2003", "이영희", chId, "MSG_1001", folder);
-            _ = _receiverManager.StartDownloadAsync(serverIp, serverPort, "EMP_2004", "박민수", chId, "MSG_1002", folder);
-            _ = _receiverManager.StartDownloadAsync(serverIp, serverPort, "EMP_2005", "최지훈", chId, "MSG_1001", folder);
+            _ = _receiverManager.StartDownloadAsync(serverIp, serverPort, "EMP_2003", "이영희", chId, "MSG_1003", folder);
+            _ = _receiverManager.StartDownloadAsync(serverIp, serverPort, "EMP_2004", "박민수", chId, "MSG_1004", folder);
+            _ = _receiverManager.StartDownloadAsync(serverIp, serverPort, "EMP_2005", "최지훈", chId, "MSG_1005", folder);
         }
 
         /// <summary>

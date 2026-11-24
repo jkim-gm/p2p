@@ -93,6 +93,7 @@ namespace P2PTransferLib
         internal NetworkStream Stream { get; set; }
         internal SemaphoreSlim WriteLock { get; } = new SemaphoreSlim(1, 1);
         internal CancellationTokenSource Cts { get; set; }
+        internal long LastProgressTick { get; set; }
         internal bool IsPaused { get; set; }
         internal bool IsCancelled { get; set; }
     }
@@ -108,6 +109,11 @@ namespace P2PTransferLib
         /// 어디서든 접근 가능한 글로벌 수신 매니저 싱글톤 인스턴스
         /// </summary>
         public static P2PReceiverNode Instance { get; } = new P2PReceiverNode();
+
+        /// <summary>
+        /// 수신 중(Transferring)일 때 OnProgress 이벤트 및 로그를 발생시키는 최소 시간 간격 (밀리초 단위, 기본값: 500ms = 0.5초)
+        /// </summary>
+        public double ProgressIntervalMs { get; set; } = 500.0;
 
         // 여러 개의 수신 작업(Receiver)을 자동으로 관리하는 스레드 안전 컬렉션 (Key: "{peerId}_{chId}_{msgId}")
         private readonly ConcurrentDictionary<string, P2PReceiverItem> _receiverMap = new ConcurrentDictionary<string, P2PReceiverItem>();
@@ -305,8 +311,7 @@ namespace P2PTransferLib
             }
 
             CancellationToken ct = item.Cts.Token;
-            string partFilePath = Path.Combine(downloadFolder, $".p2p_{item.PeerId}_{item.ChId}_{item.MsgId}.part");
-            string idxFilePath = Path.Combine(downloadFolder, $".p2p_{item.PeerId}_{item.ChId}_{item.MsgId}.idx");
+            string partFilePath = null;
             int chunkSize = 64 * 1024;
 
             using (var client = new TcpClient())
@@ -314,15 +319,12 @@ namespace P2PTransferLib
                 client.NoDelay = true;
                 try
                 {
-                    // 기존에 받은 패킷 번호 확인 (이어받기)
-                    int startChunk = ReadSavedChunkIndex(idxFilePath);
-
                     Log($"[연결 시도] 서버({item.ServerIp}:{item.ServerPort}) 접속 중... (사번:{item.PeerId}, 이름:{item.PeerName}, chID:{item.ChId}, msgID:{item.MsgId})");
                     await client.ConnectAsync(item.ServerIp, item.ServerPort).ConfigureAwait(false);
                     NetworkStream stream = client.GetStream();
                     item.Stream = stream;
 
-                    // 1. Handshake 전송: peerID(사번), peerName(이름), chID(채널ID), msgID(파일ID) 및 시작 패킷 번호 전송
+                    // 1. Handshake 전송: peerID(사번), peerName(이름), chID(채널ID), msgID(파일ID) 전송
                     var hsReq = new HandshakeRequest
                     {
                         PeerId = item.PeerId,
@@ -330,7 +332,7 @@ namespace P2PTransferLib
                         ChId = item.ChId,
                         MsgId = item.MsgId
                     };
-                    await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Handshake, startChunk, FrameStreamHelper.SerializeJson(hsReq), ct).ConfigureAwait(false);
+                    await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Handshake, 0, FrameStreamHelper.SerializeJson(hsReq), ct).ConfigureAwait(false);
 
                     // 2. 서버로부터 파일 메타데이터(HandshakeAck) 또는 Error 수신
                     P2PFrame ackFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
@@ -368,18 +370,12 @@ namespace P2PTransferLib
                     }
                     chunkSize = fileMeta.ChunkSize > 0 ? fileMeta.ChunkSize : 64 * 1024;
 
-                    // 임시 파일(.part) 유효성 확인 (마지막 패킷이 64KB 미만일 수 있으므로 Math.Min으로 실제 기대 바이트 계산)
-                    if (startChunk > fileMeta.TotalChunks)
-                    {
-                        startChunk = 0;
-                        SaveChunkIndex(idxFilePath, 0);
-                    }
-                    long expectedPartSize = Math.Min(fileMeta.FileSize, (long)startChunk * chunkSize);
-                    if (startChunk > 0 && (!File.Exists(partFilePath) || new FileInfo(partFilePath).Length < expectedPartSize))
-                    {
-                        startChunk = 0;
-                        SaveChunkIndex(idxFilePath, 0);
-                    }
+                    // 원래 파일명 그대로 저장하기 위한 경로 설정 (다운로드 중에는 "원래파일명.part" 사용, .idx 파일 불필요!)
+                    string finalFilePath = Path.Combine(downloadFolder, item.FileName);
+                    partFilePath = finalFilePath + ".part";
+
+                    // 패킷 크기(chunkSize = 64KB)가 일정하므로, 기존 .part 파일의 크기만 보면 몇 번 패킷까지 받았는지 즉시 계산 가능 (.idx 파일 제거)
+                    int startChunk = GetSavedChunkIndexFromPartFile(partFilePath, chunkSize, item.FileSize, item.TotalChunks);
                     item.CurrentChunkIndex = startChunk;
 
                     Log($"[파일 확인] chID:'{item.ChId}', msgID:'{item.MsgId}' -> 파일명:'{item.FileName}', 크기:{P2PSenderNode.FormatBytes(item.FileSize)}, 총 {item.TotalChunks}패킷 (유효시간:{item.RemainingValidTimeText}, 시작패킷:{startChunk}번)");
@@ -420,9 +416,11 @@ namespace P2PTransferLib
                     }
 
                     // 4. 한 패킷씩 번호(RequestChunk)를 요청하고 DataChunk를 수신하여 복호화 및 SHA-256 검증
-                    using (var partFs = new FileStream(partFilePath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None))
+                    using (var partFs = new FileStream(partFilePath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite))
                     {
-                        partFs.Seek((long)startChunk * chunkSize, SeekOrigin.Begin);
+                        long resumeOffset = Math.Min(item.FileSize, (long)startChunk * chunkSize);
+                        partFs.SetLength(resumeOffset);
+                        partFs.Seek(resumeOffset, SeekOrigin.Begin);
 
                         for (int chunkIdx = startChunk; chunkIdx < item.TotalChunks; chunkIdx++)
                         {
@@ -483,34 +481,32 @@ namespace P2PTransferLib
                             int doneCount = chunkIdx + 1;
                             item.CurrentChunkIndex = doneCount;
                             item.Status = TransferStatus.Transferring;
-                            SaveChunkIndex(idxFilePath, doneCount);
 
-                            if (doneCount == 1 || doneCount == item.TotalChunks || doneCount % 5 == 0)
+                            // 0.5초(500ms, ProgressIntervalMs) 간격 또는 첫 패킷 / 마지막 패킷일 때만 이벤트 및 로그 업데이트
+                            long nowTicks = DateTime.UtcNow.Ticks;
+                            double elapsedMs = (nowTicks - item.LastProgressTick) / (double)TimeSpan.TicksPerMillisecond;
+                            bool shouldNotify = (doneCount == 1) || (doneCount == item.TotalChunks) || (elapsedMs >= ProgressIntervalMs);
+
+                            if (shouldNotify)
                             {
+                                item.LastProgressTick = nowTicks;
                                 string resumeNote = startChunk > 0 ? $" [이어받기:{startChunk}번~]" : "";
                                 Log($"[패킷 수신] <- 사번:{item.PeerId}({item.PeerName}) | chID:{item.ChId} | msgID:{item.MsgId} ({item.FileName}) | 패킷 {doneCount}/{item.TotalChunks} ({item.ProgressPercentage:0.0}%){resumeNote}");
+                                RaiseProgress(item, chunkSize, TransferStatus.Transferring, $"수신 중 ({doneCount}/{item.TotalChunks})", null);
                             }
-
-                            RaiseProgress(item, chunkSize, TransferStatus.Transferring, $"수신 중 ({doneCount}/{item.TotalChunks})", null);
                         }
                     }
 
-                    // 5. 파일 병합(Merge) 및 완료 상태 알림
+                    // 5. 파일 병합(Merge) 완료: "원래파일명.part" -> "원래파일명" 그대로 변경
                     item.Status = TransferStatus.Merging;
                     RaiseProgress(item, chunkSize, TransferStatus.Merging, "파일 병합 중...", null);
 
-                    string finalFileName = $"{item.PeerId}_{item.ChId}_{item.MsgId}_{item.FileName}";
-                    string finalFilePath = Path.Combine(downloadFolder, finalFileName);
                     if (File.Exists(finalFilePath))
                     {
                         try { File.Delete(finalFilePath); } catch { }
                     }
 
                     File.Move(partFilePath, finalFilePath);
-                    if (File.Exists(idxFilePath))
-                    {
-                        try { File.Delete(idxFilePath); } catch { }
-                    }
 
                     item.SavedFilePath = finalFilePath;
                     item.Status = TransferStatus.Completed;
@@ -518,7 +514,7 @@ namespace P2PTransferLib
                     // 송신자에게 완료(FileCompleted) 통보
                     await SendControlAsync(item, P2PCommand.FileCompleted, item.TotalChunks).ConfigureAwait(false);
 
-                    Log($"[수신 완료] 사번:{item.PeerId}({item.PeerName}) | chID:'{item.ChId}' | msgID:'{item.MsgId}' 병합 완료 -> 저장경로: {finalFilePath}");
+                    Log($"[수신 완료] 사번:{item.PeerId}({item.PeerName}) | chID:'{item.ChId}' | msgID:'{item.MsgId}' -> 원래 파일명 그대로 저장 완료: {finalFilePath}");
                     RaiseProgress(item, chunkSize, TransferStatus.Completed, "수신 완료", finalFilePath);
                 }
                 catch (OperationCanceledException)
@@ -526,13 +522,13 @@ namespace P2PTransferLib
                     if (item.IsCancelled)
                     {
                         item.Status = TransferStatus.Cancelled;
-                        CleanupTempFiles(partFilePath, idxFilePath);
-                        Log($"[취소 완료] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' 임시 조각 파일 삭제됨.");
+                        CleanupTempPartFile(partFilePath);
+                        Log($"[취소 완료] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' 임시 파일(.part) 삭제됨.");
                         RaiseProgress(item, chunkSize, TransferStatus.Cancelled, "취소됨", null);
                     }
                     else
                     {
-                        int saved = ReadSavedChunkIndex(idxFilePath);
+                        int saved = GetSavedChunkIndexFromPartFile(partFilePath, chunkSize, item.FileSize, item.TotalChunks);
                         item.CurrentChunkIndex = saved;
                         item.Status = TransferStatus.Error;
                         Log($"[연결 중단] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' ({saved}번 패킷까지 보관됨 - 다시 수신 누르면 이어받기)");
@@ -544,13 +540,13 @@ namespace P2PTransferLib
                     if (item.IsCancelled)
                     {
                         item.Status = TransferStatus.Cancelled;
-                        CleanupTempFiles(partFilePath, idxFilePath);
-                        Log($"[취소 완료] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' 임시 조각 파일 삭제됨.");
+                        CleanupTempPartFile(partFilePath);
+                        Log($"[취소 완료] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' 임시 파일(.part) 삭제됨.");
                         RaiseProgress(item, chunkSize, TransferStatus.Cancelled, "취소됨", null);
                     }
                     else
                     {
-                        int saved = ReadSavedChunkIndex(idxFilePath);
+                        int saved = GetSavedChunkIndexFromPartFile(partFilePath, chunkSize, item.FileSize, item.TotalChunks);
                         item.CurrentChunkIndex = saved;
                         item.Status = TransferStatus.Error;
                         Log($"[수신 오류] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' - {ex.Message} ({saved}번 패킷까지 보관됨 - 다시 수신 누르면 이어받기)");
@@ -579,29 +575,41 @@ namespace P2PTransferLib
             }
         }
 
-        private int ReadSavedChunkIndex(string idxPath)
+        /// <summary>
+        /// 별도의 .idx 파일 없이, "원래파일명.part"의 현재 파일 크기를 패킷 크기(64KB)로 나누어
+        /// 기존에 몇 번 패킷까지 정상 수신되었는지 즉시 계산합니다.
+        /// </summary>
+        private int GetSavedChunkIndexFromPartFile(string partPath, int chunkSize, long totalFileSize, int totalChunks)
         {
             try
             {
-                if (File.Exists(idxPath))
+                if (string.IsNullOrEmpty(partPath) || !File.Exists(partPath) || chunkSize <= 0)
+                    return 0;
+
+                long len = new FileInfo(partPath).Length;
+                if (len <= 0) return 0;
+
+                if (totalFileSize > 0 && len >= totalFileSize && totalChunks > 0)
                 {
-                    string txt = File.ReadAllText(idxPath).Trim();
-                    if (int.TryParse(txt, out int idx) && idx >= 0) return idx;
+                    return totalChunks;
                 }
+
+                int completedChunks = (int)(len / chunkSize);
+                if (totalChunks > 0 && completedChunks > totalChunks)
+                {
+                    return 0;
+                }
+                return Math.Max(0, completedChunks);
             }
-            catch { }
-            return 0;
+            catch
+            {
+                return 0;
+            }
         }
 
-        private void SaveChunkIndex(string idxPath, int completedChunks)
+        private void CleanupTempPartFile(string partPath)
         {
-            try { File.WriteAllText(idxPath, completedChunks.ToString()); } catch { }
-        }
-
-        private void CleanupTempFiles(string partPath, string idxPath)
-        {
-            try { if (File.Exists(partPath)) File.Delete(partPath); } catch { }
-            try { if (File.Exists(idxPath)) File.Delete(idxPath); } catch { }
+            try { if (!string.IsNullOrEmpty(partPath) && File.Exists(partPath)) File.Delete(partPath); } catch { }
         }
 
         private void Log(string msg)

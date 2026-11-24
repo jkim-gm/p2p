@@ -60,6 +60,11 @@ namespace P2PTransferLib
             set => _speedLimitKbps = Math.Max(0, value);
         }
 
+        /// <summary>
+        /// 전송 중(Transferring)일 때 OnProgress 이벤트 및 로그를 발생시키는 최소 시간 간격 (밀리초 단위, 기본값: 500ms = 0.5초)
+        /// </summary>
+        public double ProgressIntervalMs { get; set; } = 500.0;
+
         private TcpListener _listener;
         private CancellationTokenSource _cts;
         private bool _isRunning;
@@ -97,6 +102,7 @@ namespace P2PTransferLib
             public string MsgId { get; set; }
             public RegisteredFileItem FileItem { get; set; }
             public int LastChunkIndex { get; set; }
+            public long LastProgressTick { get; set; }
             public TcpClient Client { get; set; }
             public NetworkStream Stream { get; set; }
             public SemaphoreSlim WriteLock { get; } = new SemaphoreSlim(1, 1);
@@ -471,12 +477,18 @@ namespace P2PTransferLib
                                         session.LastChunkIndex = doneCount;
                                         double pct = fileItem.TotalChunks > 0 ? (doneCount * 100.0 / fileItem.TotalChunks) : 100.0;
 
-                                        if (doneCount == 1 || doneCount == fileItem.TotalChunks || doneCount % 5 == 0)
+                                        // 0.5초(500ms, ProgressIntervalMs) 간격 또는 첫 패킷 / 마지막 패킷일 때만 이벤트 및 로그 업데이트
+                                        long nowTicks = DateTime.UtcNow.Ticks;
+                                        double elapsedMs = (nowTicks - session.LastProgressTick) / (double)TimeSpan.TicksPerMillisecond;
+                                        bool shouldNotify = (doneCount == 1) || (doneCount == fileItem.TotalChunks) || (elapsedMs >= ProgressIntervalMs);
+
+                                        if (shouldNotify)
                                         {
+                                            session.LastProgressTick = nowTicks;
                                             Log($"[패킷 송신] -> {peerName}({peerId}) | chID:{chId} | msgID:{msgId} ({fileItem.FileName}) | 패킷 {doneCount}/{fileItem.TotalChunks} ({pct:0.0}%)");
                                         }
 
-                                        RaiseProgress(sessionKey, fileItem, peerId, peerName, doneCount, TransferStatus.Transferring, $"전송 중 ({doneCount}/{fileItem.TotalChunks})");
+                                        RaiseProgress(sessionKey, fileItem, peerId, peerName, doneCount, TransferStatus.Transferring, $"전송 중 ({doneCount}/{fileItem.TotalChunks})", shouldNotify);
                                     }
                                     break;
 
@@ -573,9 +585,9 @@ namespace P2PTransferLib
             OnLog?.Invoke($"[{DateTime.Now:HH:mm:ss.fff}] {msg}");
         }
 
-        private void RaiseProgress(string sessionKey, RegisteredFileItem item, string peerId, string peerName, int completedChunks, TransferStatus status, string message)
+        private void RaiseProgress(string sessionKey, RegisteredFileItem item, string peerId, string peerName, int completedChunks, TransferStatus status, string message, bool fireEvent = true)
         {
-            // 송신 상태 목록(_transferStatusMap) 자동 갱신
+            // 송신 상태 목록(_transferStatusMap)은 조회 시 항상 최신 상태이도록 매번 즉시 갱신
             string mapKey = $"{item.ChId}_{item.MsgId}_{peerId}";
             _transferStatusMap[mapKey] = new SenderTransferStatusItem
             {
@@ -591,6 +603,8 @@ namespace P2PTransferLib
                 Status = status,
                 ExpireTimeUtc = item.ExpireTimeUtc
             };
+
+            if (!fireEvent) return;
 
             long transferred = Math.Min(item.FileSize, (long)completedChunks * item.ChunkSize);
             OnProgress?.Invoke(this, new TransferProgressEventArgs

@@ -41,14 +41,17 @@ namespace P2PTransferLib
 
                 string dlDir = Path.Combine(tempRoot, "Downloads");
 
-                // 5개 요청을 동시에 시작 (3개는 즉시 전송, 2개는 대기 후 전송)
+                // 서로 다른 파일 2개를 같은 폴더에 원래 파일명 그대로(FileA.bin, FileB.bin) 동시 다운로드
                 var t1 = receiver.StartDownloadAsync("127.0.0.1", testP2PPort, "EMP_101", "김철수", "CH_01", "MSG_001", dlDir);
-                var t2 = receiver.StartDownloadAsync("127.0.0.1", testP2PPort, "EMP_102", "이영희", "CH_01", "MSG_001", dlDir);
-                var t3 = receiver.StartDownloadAsync("127.0.0.1", testP2PPort, "EMP_103", "박민수", "CH_01", "MSG_002", dlDir);
-                var t4 = receiver.StartDownloadAsync("127.0.0.1", testP2PPort, "EMP_104", "최지훈", "CH_01", "MSG_002", dlDir);
-                var t5 = receiver.StartDownloadAsync("127.0.0.1", testP2PPort, "EMP_105", "정수진", "CH_01", "MSG_001", dlDir);
+                var t2 = receiver.StartDownloadAsync("127.0.0.1", testP2PPort, "EMP_101", "김철수", "CH_01", "MSG_002", dlDir);
 
-                await Task.WhenAll(t1, t2, t3, t4, t5);
+                await Task.WhenAll(t1, t2);
+
+                byte[] recv1 = File.ReadAllBytes(Path.Combine(dlDir, "FileA.bin"));
+                byte[] recv2 = File.ReadAllBytes(Path.Combine(dlDir, "FileB.bin"));
+
+                if (!recv1.SequenceEqual(data1) || !recv2.SequenceEqual(data2))
+                    throw new InvalidDataException("수신 파일 무결성 불일치");
 
                 return "OK";
             }
