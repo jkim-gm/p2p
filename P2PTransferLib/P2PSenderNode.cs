@@ -14,7 +14,7 @@ namespace P2PTransferLib
     /// P2P 송신자(서버) 모듈
     /// - 프로그램 내에 글로벌 변수 하나(또는 P2PSenderNode.Instance 싱글톤)만 두고 사용합니다.
     /// - chID(채널ID) + msgID(파일ID) 조합으로 파일을 등록하고, 수신자가 (peerID, peerName, chID, msgID)로 요청하면 백그라운드로 동시 전송합니다.
-    /// - GetRegisteredFiles() 및 GetSenderTransferList()를 통해 등록된 송신 파일 목록, 각 수신자별 전송 상태, 남은 유효시간(30분)을 언제든 조회할 수 있습니다.
+    /// - 잘못된 파일 경로, 포트 번호, 미등록 파일 요청, 네트워크 끊김 등 모든 예외 상황을 내부에서 안전하게 처리하고 OnError / OnLog로 상세 메시지를 전달합니다.
     /// </summary>
     public class P2PSenderNode : IDisposable
     {
@@ -89,9 +89,14 @@ namespace P2PTransferLib
         public event Action<string> OnLog;
 
         /// <summary>
-        /// 진행 상태 이벤트 (WaitingQueue, Transferring, Paused, Completed, Cancelled, Expired, Error 모두 전달됨)
+        /// 진행 상태 이벤트 (WaitingQueue, Transferring, Paused, Completed, Cancelled, Expired, Error, FileMissing 모두 전달됨)
         /// </summary>
         public event EventHandler<TransferProgressEventArgs> OnProgress;
+
+        /// <summary>
+        /// 상세 오류 이벤트 (잘못된 파일 등록, 포트 충돌, 미등록 파일 요청, 네트워크 오류 등 발생 시 호출됨)
+        /// </summary>
+        public event EventHandler<P2PErrorEventArgs> OnError;
 
         private class ClientSession
         {
@@ -137,27 +142,69 @@ namespace P2PTransferLib
 
         /// <summary>
         /// 1. 송신자(서버) P2P TCP 포트를 백그라운드로 오픈합니다.
+        /// 잘못된 포트 번호나 IP, 이미 사용 중인 포트일 경우 예외로 죽지 않고 오류 로그/이벤트를 발생시킵니다.
         /// </summary>
-        public void StartServer(int port, string bindIp = "127.0.0.1")
+        public bool StartServer(int port, string bindIp = "127.0.0.1")
         {
-            if (_isRunning) return;
-
-            Port = port;
-            _cts = new CancellationTokenSource();
-
-            IPAddress ip = IPAddress.Any;
-            if (!string.IsNullOrWhiteSpace(bindIp) &&
-                (bindIp.Trim() == "127.0.0.1" || bindIp.Trim().Equals("localhost", StringComparison.OrdinalIgnoreCase)))
+            if (_isRunning)
             {
-                ip = IPAddress.Loopback; // 로컬 테스트 시 방화벽 팝업 방지
+                Log($"[서버 안내] 이미 포트 {Port}에서 P2P 송신 서버가 실행 중입니다.");
+                return true;
             }
 
-            _listener = new TcpListener(ip, port);
-            _listener.Start();
-            _isRunning = true;
+            if (port <= 0 || port > 65535)
+            {
+                RaiseError(P2PErrorCode.InvalidParameter, null, null, null, null,
+                    $"잘못된 포트 번호({port})입니다. 포트 번호는 1 ~ 65535 사이여야 합니다.");
+                return false;
+            }
 
-            Log($"[서버 시작] P2P 송신 서버 포트 오픈 완료 (Bind={ip}:{port}, 패킷크기={ChunkSize / 1024}KB, 동시제한={MaxConcurrentReceivers})");
-            Task.Run(() => AcceptClientsLoopAsync(_cts.Token));
+            IPAddress ip = IPAddress.Any;
+            if (!string.IsNullOrWhiteSpace(bindIp))
+            {
+                string trimmedIp = bindIp.Trim();
+                if (trimmedIp == "127.0.0.1" || trimmedIp.Equals("localhost", StringComparison.OrdinalIgnoreCase))
+                {
+                    ip = IPAddress.Loopback; // 로컬 테스트 시 방화벽 팝업 방지
+                }
+                else if (trimmedIp == "0.0.0.0" || trimmedIp == "*")
+                {
+                    ip = IPAddress.Any;
+                }
+                else if (!IPAddress.TryParse(trimmedIp, out ip))
+                {
+                    RaiseError(P2PErrorCode.InvalidParameter, null, null, null, null,
+                        $"잘못된 바인딩 IP 주소 형식('{bindIp}')입니다. 올바른 IPv4 주소를 입력해주세요.");
+                    return false;
+                }
+            }
+
+            try
+            {
+                Port = port;
+                _cts = new CancellationTokenSource();
+                _listener = new TcpListener(ip, port);
+                _listener.Start();
+                _isRunning = true;
+
+                Log($"[서버 시작] P2P 송신 서버 포트 오픈 완료 (Bind={ip}:{port}, 패킷크기={ChunkSize / 1024}KB, 동시제한={MaxConcurrentReceivers})");
+                Task.Run(() => AcceptClientsLoopAsync(_cts.Token));
+                return true;
+            }
+            catch (SocketException sockEx)
+            {
+                _isRunning = false;
+                RaiseError(P2PErrorCode.ServerBindError, null, null, null, null,
+                    $"서버 포트({ip}:{port}) 오픈 실패: 이미 다른 프로그램이 포트를 사용 중이거나 해당 IP에 바인딩할 수 없습니다. ({sockEx.Message})", sockEx);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _isRunning = false;
+                RaiseError(P2PErrorCode.ServerBindError, null, null, null, null,
+                    $"서버 시작 중 알 수 없는 오류 발생: {ex.Message}", ex);
+                return false;
+            }
         }
 
         /// <summary>
@@ -192,43 +239,175 @@ namespace P2PTransferLib
 
         /// <summary>
         /// 2. 전송할 파일과 채널ID(chId), 파일ID(msgId)를 서버에 등록합니다. (유효시간 기본 30분)
+        /// 존재하지 않는 파일이나 잘못된 값을 입력해도 프로그램이 죽지 않고 오류 메시지를 출력한 뒤 null을 반환합니다.
         /// </summary>
         public RegisteredFileItem RegisterFile(string chId, string msgId, string filePath)
         {
+            TryRegisterFile(chId, msgId, filePath, out RegisteredFileItem item, out _);
+            return item;
+        }
+
+        /// <summary>
+        /// 안전한 파일 등록 메서드 (성공 여부 bool 반환 및 실패 시 상세 errorMessage 반환)
+        /// </summary>
+        public bool TryRegisterFile(string chId, string msgId, string filePath, out RegisteredFileItem registeredItem, out string errorMessage)
+        {
+            registeredItem = null;
+            errorMessage = null;
+
+            if (string.IsNullOrWhiteSpace(chId))
+            {
+                chId = "DEFAULT_CH";
+            }
+
+            if (string.IsNullOrWhiteSpace(msgId))
+            {
+                errorMessage = "파일ID(msgID)가 비어 있습니다. 유효한 파일ID(msgID)를 입력해주세요.";
+                RaiseError(P2PErrorCode.InvalidParameter, chId, msgId, null, null, errorMessage);
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(filePath))
+            {
+                errorMessage = $"파일 경로가 입력되지 않았습니다. (chID:'{chId}', msgID:'{msgId}')";
+                RaiseError(P2PErrorCode.InvalidParameter, chId, msgId, null, null, errorMessage);
+                return false;
+            }
+
+            try
+            {
+                string cleanPath = filePath.Trim().Trim('"');
+                if (cleanPath.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
+                {
+                    errorMessage = $"파일 경로에 허용되지 않는 잘못된 문자가 포함되어 있습니다: '{filePath}'";
+                    RaiseError(P2PErrorCode.InvalidParameter, chId, msgId, null, null, errorMessage);
+                    return false;
+                }
+
+                if (!File.Exists(cleanPath))
+                {
+                    errorMessage = $"등록할 파일이 존재하지 않습니다. 경로를 확인해주세요: '{cleanPath}' (chID:'{chId}', msgID:'{msgId}')";
+                    RaiseError(P2PErrorCode.SourceFileNotFound, chId, msgId, null, null, errorMessage);
+                    return false;
+                }
+
+                var fi = new FileInfo(cleanPath);
+                string key = BuildFileKey(chId, msgId);
+
+                // (chId, msgId, filePath)가 모두 동일한 중복 아이템이 이미 등록되어 있는지 확인
+                if (_registeredFiles.TryGetValue(key, out var existingItem))
+                {
+                    if (string.Equals(existingItem.LocalSourcePath, fi.FullName, StringComparison.OrdinalIgnoreCase) && !existingItem.IsExpired)
+                    {
+                        registeredItem = existingItem;
+                        errorMessage = $"이미 동일한 파일(chID:'{chId.Trim()}', msgID:'{msgId.Trim()}', 경로:'{fi.FullName}')이 등록되어 있어 중복 등록을 건너뜁니다.";
+                        Log("[중복 등록 무시] " + errorMessage);
+                        return false;
+                    }
+                }
+
+                // 파일 읽기 접근 권한 사전 테스트
+                using (var testFs = new FileStream(fi.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                }
+
+                int currentChunkSize = ChunkSize > 0 ? ChunkSize : 64 * 1024;
+                int totalChunks = (int)((fi.Length + currentChunkSize - 1) / currentChunkSize);
+                if (totalChunks == 0) totalChunks = 1;
+
+                var nowUtc = DateTime.UtcNow;
+                registeredItem = new RegisteredFileItem
+                {
+                    ChId = chId.Trim(),
+                    MsgId = msgId.Trim(),
+                    FileName = fi.Name,
+                    LocalSourcePath = fi.FullName,
+                    FileSize = fi.Length,
+                    ChunkSize = currentChunkSize,
+                    TotalChunks = totalChunks,
+                    CreatedUtcTicks = nowUtc.Ticks,
+                    ExpireUtcTicks = nowUtc.Add(ValidDuration).Ticks
+                };
+
+                _registeredFiles[key] = registeredItem;
+                Log($"[파일 등록 완료] chID='{registeredItem.ChId}', msgID='{registeredItem.MsgId}', 파일명='{registeredItem.FileName}', 크기={FormatBytes(registeredItem.FileSize)} (총 {registeredItem.TotalChunks}패킷, 유효시간:{registeredItem.RemainingValidTimeText})");
+                return true;
+            }
+            catch (UnauthorizedAccessException authEx)
+            {
+                errorMessage = $"파일 읽기 권한이 없거나 접근이 거부되었습니다: '{filePath}' ({authEx.Message})";
+                RaiseError(P2PErrorCode.DiskAccessError, chId, msgId, null, null, errorMessage, authEx);
+                return false;
+            }
+            catch (IOException ioEx)
+            {
+                errorMessage = $"파일이 다른 프로그램에서 독점 사용 중이어서 읽을 수 없습니다: '{filePath}' ({ioEx.Message})";
+                RaiseError(P2PErrorCode.DiskAccessError, chId, msgId, null, null, errorMessage, ioEx);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                errorMessage = $"파일 등록 중 오류 발생 ('{filePath}'): {ex.Message}";
+                RaiseError(P2PErrorCode.InvalidParameter, chId, msgId, null, null, errorMessage, ex);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 등록했던 송신 파일(chId, msgId)을 서버 목록에서 등록 해제(Unregister)합니다.
+        /// 만약 해당 파일을 현재 전송 중인 세션이 있다면 함께 취소합니다.
+        /// </summary>
+        public bool UnregisterFile(string chId, string msgId)
+        {
             if (string.IsNullOrWhiteSpace(chId)) chId = "DEFAULT_CH";
             if (string.IsNullOrWhiteSpace(msgId))
-                throw new ArgumentException("파일ID(msgId)를 입력해야 합니다.");
-            if (!File.Exists(filePath))
-                throw new FileNotFoundException("등록할 파일이 존재하지 않습니다.", filePath);
-
-            var fi = new FileInfo(filePath);
-            int totalChunks = (int)((fi.Length + ChunkSize - 1) / ChunkSize);
-            if (totalChunks == 0) totalChunks = 1;
-
-            var nowUtc = DateTime.UtcNow;
-            var item = new RegisteredFileItem
             {
-                ChId = chId.Trim(),
-                MsgId = msgId.Trim(),
-                FileName = fi.Name,
-                LocalSourcePath = fi.FullName,
-                FileSize = fi.Length,
-                ChunkSize = ChunkSize,
-                TotalChunks = totalChunks,
-                CreatedUtcTicks = nowUtc.Ticks,
-                ExpireUtcTicks = nowUtc.Add(ValidDuration).Ticks
-            };
+                Log("[등록 해제 실패] 파일ID(msgID)가 비어 있습니다.");
+                return false;
+            }
 
-            string key = BuildFileKey(item.ChId, item.MsgId);
-            _registeredFiles[key] = item;
-            Log($"[파일 등록] chID='{item.ChId}', msgID='{item.MsgId}', 파일명='{item.FileName}', 크기={FormatBytes(item.FileSize)} (총 {item.TotalChunks}패킷, 유효시간:{item.RemainingValidTimeText})");
-            return item;
+            string key = BuildFileKey(chId, msgId);
+            if (_registeredFiles.TryRemove(key, out var removed))
+            {
+                // 진행 중인 전송이 있으면 함께 취소
+                CancelTransfer(removed.ChId, removed.MsgId);
+
+                // 상태 기록 맵에서도 정리
+                foreach (var kv in _transferStatusMap.ToList())
+                {
+                    if (kv.Value.ChId == removed.ChId && kv.Value.MsgId == removed.MsgId)
+                    {
+                        _transferStatusMap.TryRemove(kv.Key, out _);
+                    }
+                }
+
+                Log($"[파일 등록 해제(Unregister)] chID='{removed.ChId}', msgID='{removed.MsgId}', 파일명='{removed.FileName}' 등록 해제 완료.");
+                return true;
+            }
+            else
+            {
+                Log($"[등록 해제 안내] 등록되어 있지 않은 파일입니다. (chID:'{chId.Trim()}', msgID:'{msgId.Trim()}')");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 등록된 모든 송신 파일을 일괄 등록 해제(UnregisterAll)합니다.
+        /// </summary>
+        public void UnregisterAllFiles()
+        {
+            foreach (var item in _registeredFiles.Values.ToList())
+            {
+                UnregisterFile(item.ChId, item.MsgId);
+            }
+            _registeredFiles.Clear();
+            _transferStatusMap.Clear();
+            Log("[전체 파일 등록 해제] 모든 송신 파일 등록이 초기화되었습니다.");
         }
 
         /// <summary>
         /// [송신 파일 목록 조회 1]
         /// 등록된 송신 파일들의 목록과 각 파일의 상태(Ready, Expired, FileMissing) 및 남은 유효시간(RemainingValidTimeText)을 조회합니다.
-        /// (chId를 지정하면 해당 채널의 파일만 조회하고, null이면 전체 조회)
         /// </summary>
         public List<RegisteredFileItem> GetRegisteredFiles(string chId = null)
         {
@@ -260,6 +439,7 @@ namespace P2PTransferLib
         /// </summary>
         public void CancelTransfer(string chId, string msgId, string peerId = null)
         {
+            int count = 0;
             foreach (var kv in _activeSessions)
             {
                 var s = kv.Value;
@@ -267,6 +447,7 @@ namespace P2PTransferLib
                     (string.IsNullOrEmpty(msgId) || s.MsgId == msgId) &&
                     (string.IsNullOrEmpty(peerId) || s.PeerId == peerId))
                 {
+                    count++;
                     s.IsCancelled = true;
                     try
                     {
@@ -281,6 +462,11 @@ namespace P2PTransferLib
                         RaiseProgress(s.SessionKey, s.FileItem, s.PeerId, s.PeerName, s.LastChunkIndex, TransferStatus.Cancelled, "송신자에 의해 취소됨");
                     }
                 }
+            }
+
+            if (count == 0)
+            {
+                Log($"[송신 취소 안내] 현재 전송 중인 해당 항목(chID:'{chId}', msgID:'{msgId}')이 없습니다.");
             }
         }
 
@@ -321,45 +507,84 @@ namespace P2PTransferLib
                 {
                     NetworkStream stream = tcpClient.GetStream();
 
-                    // 1. 수신자로부터 Handshake 패킷 수신 (peerId:사번, peerName:이름, chId:채널ID, msgId:파일ID)
+                    // 1. 수신자로부터 Handshake 또는 QueryMetaOnly 패킷 수신
                     P2PFrame hsFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
-                    if (hsFrame == null || hsFrame.Command != P2PCommand.Handshake)
+                    if (hsFrame == null || (hsFrame.Command != P2PCommand.Handshake && hsFrame.Command != P2PCommand.QueryMetaOnly))
                         return;
 
+                    bool isMetaQueryOnly = (hsFrame.Command == P2PCommand.QueryMetaOnly);
                     var req = FrameStreamHelper.DeserializeJson<HandshakeRequest>(hsFrame.GetPayloadText());
-                    if (req == null) return;
+                    if (req == null)
+                    {
+                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, "INVALID_PARAM:요청 데이터(Handshake)가 올바르지 않습니다.", ct).ConfigureAwait(false);
+                        return;
+                    }
 
-                    peerId = req.PeerId ?? "UnknownID";
-                    peerName = req.PeerName ?? "UnknownName";
+                    peerId = string.IsNullOrWhiteSpace(req.PeerId) ? "UnknownID" : req.PeerId.Trim();
+                    peerName = string.IsNullOrWhiteSpace(req.PeerName) ? "UnknownName" : req.PeerName.Trim();
                     chId = string.IsNullOrWhiteSpace(req.ChId) ? "DEFAULT_CH" : req.ChId.Trim();
                     msgId = (req.MsgId ?? "").Trim();
                     int startChunk = hsFrame.ChunkIndex;
 
-                    Log($"[수신자 요청 확인] 사번(peerID)='{peerId}', 이름(peerName)='{peerName}', 채널ID(chID)='{chId}', 파일ID(msgID)='{msgId}', 요청 시작패킷={startChunk}번");
+                    if (!isMetaQueryOnly)
+                    {
+                        Log($"[수신자 요청 확인] 사번(peerID)='{peerId}', 이름(peerName)='{peerName}', 채널ID(chID)='{chId}', 파일ID(msgID)='{msgId}'");
+                    }
 
-                    // 2. 요청한 (chId + msgId) 파일이 등록되어 있는지 확인
+                    // 2. 요청한 (chId + msgId) 파일이 RegisterFile로 등록되어 있는지 확인
                     string fileKey = BuildFileKey(chId, msgId);
                     if (!_registeredFiles.TryGetValue(fileKey, out fileItem))
                     {
-                        Log($"[요청 거부] 미등록 파일 (chID='{chId}', msgID='{msgId}') 요청됨 - 사번:{peerId}({peerName})");
-                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, $"등록되지 않은 파일(chID:{chId}, msgID:{msgId}) 입니다.", ct).ConfigureAwait(false);
+                        string unregMsg = $"송신자 서버에 등록(RegisterFile)되지 않은 파일입니다. (요청한 chID:'{chId}', msgID:'{msgId}')";
+                        RaiseError(P2PErrorCode.UnregisteredFileRequested, chId, msgId, peerId, peerName,
+                            $"수신자 {peerName}({peerId})가 미등록 파일(chID:'{chId}', msgID:'{msgId}')을 요청하여 거부했습니다.");
+                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, "UNREGISTERED:" + unregMsg, ct).ConfigureAwait(false);
                         return;
                     }
 
                     // 3. 30분 유효시간 만료 여부 확인
                     if (fileItem.IsExpired)
                     {
-                        Log($"[요청 거부] chID='{chId}', msgID='{msgId}' 유효시간(30분) 만료됨 - 사번:{peerId}({peerName})");
-                        RaiseProgress(sessionKey, fileItem, peerId, peerName, startChunk, TransferStatus.Expired, "유효시간(30분) 만료됨");
-                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, "EXPIRED:유효시간(30분)이 만료된 파일입니다.", ct).ConfigureAwait(false);
+                        string expMsg = $"파일의 유효시간(30분)이 만료되어 전송할 수 없습니다. (chID:'{chId}', msgID:'{msgId}', 파일명:'{fileItem.FileName}')";
+                        RaiseError(P2PErrorCode.FileExpired, chId, msgId, peerId, peerName, expMsg);
+                        if (!isMetaQueryOnly)
+                        {
+                            RaiseProgress(sessionKey, fileItem, peerId, peerName, startChunk, TransferStatus.Expired, expMsg, true, P2PErrorCode.FileExpired);
+                        }
+                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, "EXPIRED:" + expMsg, ct).ConfigureAwait(false);
                         return;
                     }
 
+                    // 4. 등록 당시에는 있었으나 현재 디스크에서 원본 파일이 삭제/이동된 경우
                     if (!File.Exists(fileItem.LocalSourcePath))
                     {
-                        Log($"[요청 거부] 원본 파일 없음 ({fileItem.LocalSourcePath})");
-                        RaiseProgress(sessionKey, fileItem, peerId, peerName, startChunk, TransferStatus.FileMissing, "원본 파일 없음");
-                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, "서버에 원본 파일이 존재하지 않습니다.", ct).ConfigureAwait(false);
+                        string missingMsg = $"송신자 PC에서 원본 파일('{fileItem.FileName}')을 찾을 수 없습니다. 파일이 삭제되었거나 이동되었습니다.";
+                        RaiseError(P2PErrorCode.SourceFileNotFound, chId, msgId, peerId, peerName, missingMsg);
+                        if (!isMetaQueryOnly)
+                        {
+                            RaiseProgress(sessionKey, fileItem, peerId, peerName, startChunk, TransferStatus.FileMissing, missingMsg, true, P2PErrorCode.SourceFileNotFound);
+                        }
+                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Error, 0, "FILE_MISSING:" + missingMsg, ct).ConfigureAwait(false);
+                        return;
+                    }
+
+                    // 5. 수신자에게 파일 메타데이터(HandshakeAck) 전송
+                    var ackMeta = new HandshakeResponse
+                    {
+                        ChId = fileItem.ChId,
+                        MsgId = fileItem.MsgId,
+                        FileName = fileItem.FileName,
+                        FileSize = fileItem.FileSize,
+                        ChunkSize = fileItem.ChunkSize,
+                        TotalChunks = fileItem.TotalChunks,
+                        CreatedUtcTicks = fileItem.CreatedUtcTicks,
+                        ExpireUtcTicks = fileItem.ExpireUtcTicks
+                    };
+
+                    if (isMetaQueryOnly)
+                    {
+                        // 사전 이어받기 진행률 조회용(QueryMetaOnly)이면 메타데이터만 응답하고 즉시 종료
+                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.HandshakeAck, 0, FrameStreamHelper.SerializeJson(ackMeta), ct).ConfigureAwait(false);
                         return;
                     }
 
@@ -378,21 +603,9 @@ namespace P2PTransferLib
                     };
                     _activeSessions[sessionKey] = session;
 
-                    // 4. 수신자에게 파일 메타데이터(HandshakeAck - 유효시간 ExpireUtcTicks 포함) 전송
-                    var ackMeta = new HandshakeResponse
-                    {
-                        ChId = fileItem.ChId,
-                        MsgId = fileItem.MsgId,
-                        FileName = fileItem.FileName,
-                        FileSize = fileItem.FileSize,
-                        ChunkSize = fileItem.ChunkSize,
-                        TotalChunks = fileItem.TotalChunks,
-                        CreatedUtcTicks = fileItem.CreatedUtcTicks,
-                        ExpireUtcTicks = fileItem.ExpireUtcTicks
-                    };
                     await SendSessionControlAsync(session, P2PCommand.HandshakeAck, startChunk, FrameStreamHelper.SerializeJson(ackMeta), ct).ConfigureAwait(false);
 
-                    // 5. 동시 전송 제한 확인 (초과 시 WaitQueue 명령 보내고 슬롯이 빌 때까지 대기)
+                    // 6. 동시 전송 제한 확인 (초과 시 WaitQueue 명령 보내고 슬롯이 빌 때까지 대기)
                     if (!TryAcquireSlot(out TaskCompletionSource<bool> waiterTcs))
                     {
                         Log($"[수신 대기열 진입] 사번:{peerId}({peerName}), chID:'{chId}', msgID:'{msgId}' - 동시 전송 제한({MaxConcurrentReceivers}개) 초과로 대기 중...");
@@ -406,11 +619,11 @@ namespace P2PTransferLib
                     }
                     slotAcquired = true;
 
-                    // 6. 대기열 통과 -> QueueReady 전송
+                    // 7. 대기열 통과 -> QueueReady 전송
                     Log($"[전송 시작 승인] 사번:{peerId}({peerName}), chID:'{chId}', msgID:'{msgId}' ({fileItem.FileName}) 패킷 전송을 시작합니다.");
                     await SendSessionControlAsync(session, P2PCommand.QueueReady, startChunk, "READY", ct).ConfigureAwait(false);
 
-                    // 7. 수신자가 한 패킷씩 번호(RequestChunk)를 요청하면 해당 패킷을 암호화+SHA256과 함께 전송
+                    // 8. 수신자가 한 패킷씩 번호(RequestChunk)를 요청하면 해당 패킷을 암호화+SHA256과 함께 전송
                     using (var fs = new FileStream(fileItem.LocalSourcePath, FileMode.Open, FileAccess.Read, FileShare.Read))
                     {
                         byte[] readBuf = new byte[fileItem.ChunkSize];
@@ -420,7 +633,7 @@ namespace P2PTransferLib
                             P2PFrame reqFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
                             if (reqFrame == null)
                             {
-                                throw new IOException("수신자 연결이 끊어졌습니다.");
+                                throw new IOException("수신자와의 네트워크 연결이 비정상적으로 끊어졌습니다.");
                             }
 
                             switch (reqFrame.Command)
@@ -430,7 +643,7 @@ namespace P2PTransferLib
                                         int chunkIdx = reqFrame.ChunkIndex;
                                         if (chunkIdx < 0 || chunkIdx >= fileItem.TotalChunks)
                                         {
-                                            await SendSessionControlAsync(session, P2PCommand.Error, chunkIdx, $"잘못된 패킷 번호({chunkIdx}) 요청됨", ct).ConfigureAwait(false);
+                                            await SendSessionControlAsync(session, P2PCommand.Error, chunkIdx, $"INVALID_CHUNK:잘못된 패킷 번호({chunkIdx}) 요청됨", ct).ConfigureAwait(false);
                                             break;
                                         }
 
@@ -523,8 +736,10 @@ namespace P2PTransferLib
                     if (fileItem != null && (session == null || !session.IsCancelled))
                     {
                         int lastIdx = session != null ? session.LastChunkIndex : 0;
-                        Log($"[송신 중단/오류] 수신자:{peerName}({peerId}), chID:{chId}, msgID:{msgId} - {ex.Message} (패킷 {lastIdx}/{fileItem.TotalChunks} 완료 - 이어받기 가능)");
-                        RaiseProgress(sessionKey, fileItem, peerId, peerName, lastIdx, TransferStatus.Error, ex.Message);
+                        double savedPct = fileItem.TotalChunks > 0 ? (lastIdx * 100.0 / fileItem.TotalChunks) : 0.0;
+                        string errMsg = $"송신 중 네트워크 연결이 끊어졌거나 오류가 발생했습니다: {ex.Message} (전송 완료된 진행률: {savedPct:0.0}%, {lastIdx}/{fileItem.TotalChunks} 패킷 - 재접속 시 이어보내기 가능)";
+                        RaiseError(P2PErrorCode.NetworkDisconnected, chId, msgId, peerId, peerName, errMsg, ex);
+                        RaiseProgress(sessionKey, fileItem, peerId, peerName, lastIdx, TransferStatus.Error, errMsg, true, P2PErrorCode.NetworkDisconnected);
                     }
                 }
                 finally
@@ -585,9 +800,23 @@ namespace P2PTransferLib
             OnLog?.Invoke($"[{DateTime.Now:HH:mm:ss.fff}] {msg}");
         }
 
-        private void RaiseProgress(string sessionKey, RegisteredFileItem item, string peerId, string peerName, int completedChunks, TransferStatus status, string message, bool fireEvent = true)
+        private void RaiseError(P2PErrorCode code, string chId, string msgId, string peerId, string peerName, string errorMessage, Exception ex = null)
         {
-            // 송신 상태 목록(_transferStatusMap)은 조회 시 항상 최신 상태이도록 매번 즉시 갱신
+            Log($"[오류 - {code}] {errorMessage}");
+            OnError?.Invoke(this, new P2PErrorEventArgs
+            {
+                ErrorCode = code,
+                ChId = chId,
+                MsgId = msgId,
+                PeerId = peerId,
+                PeerName = peerName,
+                ErrorMessage = errorMessage,
+                Exception = ex
+            });
+        }
+
+        private void RaiseProgress(string sessionKey, RegisteredFileItem item, string peerId, string peerName, int completedChunks, TransferStatus status, string message, bool fireEvent = true, P2PErrorCode errorCode = P2PErrorCode.None)
+        {
             string mapKey = $"{item.ChId}_{item.MsgId}_{peerId}";
             _transferStatusMap[mapKey] = new SenderTransferStatusItem
             {
@@ -621,6 +850,7 @@ namespace P2PTransferLib
                 TransferredBytes = transferred,
                 TotalBytes = item.FileSize,
                 Status = status,
+                ErrorCode = errorCode,
                 ExpireTimeUtc = item.ExpireTimeUtc,
                 Message = message
             });

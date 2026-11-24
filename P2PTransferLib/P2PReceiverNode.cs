@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -11,7 +12,6 @@ namespace P2PTransferLib
 {
     /// <summary>
     /// 개별 수신 작업(Receiver 인스턴스 1개)의 상태, 유효시간 및 제어 정보를 담는 클래스
-    /// P2PReceiverNode.Instance.GetReceiverList()로 조회할 때 상태와 남은 유효시간, 파일 존재 여부('파일없음')까지 모두 확인할 수 있습니다.
     /// </summary>
     public class P2PReceiverItem
     {
@@ -23,14 +23,20 @@ namespace P2PTransferLib
         public string ChId { get; set; }        // 채널ID (chID)
         public string MsgId { get; set; }       // 파일ID (msgID)
         public string FileName { get; set; }
+        public string DownloadFolder { get; set; }
         public long FileSize { get; set; }
         public int CurrentChunkIndex { get; set; }
         public int TotalChunks { get; set; }
         public double ProgressPercentage => TotalChunks > 0 ? Math.Min(100.0, CurrentChunkIndex * 100.0 / TotalChunks) : 0.0;
         public TransferStatus Status { get; set; }
+        public P2PErrorCode LastErrorCode { get; set; }
+        public string LastErrorMessage { get; set; }
         public string SavedFilePath { get; set; }
+        public string PartFilePath { get; set; }
         public DateTime StartedTime { get; set; }
         public DateTime ExpireTimeUtc { get; set; }
+        public bool IsMissingNotified { get; set; }
+        public bool IsExpiredNotified { get; set; }
 
         /// <summary>
         /// 30분 유효시간이 만료되었는지 여부
@@ -72,7 +78,6 @@ namespace P2PTransferLib
         /// </summary>
         public void RefreshStatus()
         {
-            // 1. 완료된 파일이 로컬 디스크에서 사라졌으면 '파일없음(FileMissing)' 상태로 변경
             if (Status == TransferStatus.Completed && !string.IsNullOrEmpty(SavedFilePath))
             {
                 if (!File.Exists(SavedFilePath))
@@ -81,7 +86,6 @@ namespace P2PTransferLib
                 }
             }
 
-            // 2. 완료/취소되지 않은 상태에서 유효시간(30분)이 지났으면 'Expired' 표시
             if (Status != TransferStatus.Completed && Status != TransferStatus.FileMissing &&
                 Status != TransferStatus.Cancelled && Status != TransferStatus.Transferring &&
                 IsExpired)
@@ -101,7 +105,8 @@ namespace P2PTransferLib
     /// <summary>
     /// P2P 수신자(클라이언트) 자동 리스트 관리 모듈
     /// - StartDownloadAsync()를 호출할 때마다 P2PReceiverItem 객체가 생성되어 내부 리스트(_receiverMap)에 자동 등록됩니다.
-    /// - GetReceiverList()로 수신 목록을 조회하면 각 파일의 상태(Status), 진행률(%), 남은 유효시간(RemainingValidTimeText), 완료 파일 삭제 여부(FileMissing)를 즉시 확인할 수 있습니다.
+    /// - CheckPartialFileProgress() 또는 CheckPartialProgressFromServerAsync()를 통해 기존에 받다 중지된 파일이 몇 퍼센트 받아졌는지 사전 확인할 수 있습니다.
+    /// - 미등록 파일 요청, 네트워크 접속 불가, 타임아웃, 유효시간 만료, 디스크 권한 오류 등 모든 오류에 대해 상세 메시지를 제공합니다.
     /// </summary>
     public class P2PReceiverNode : IDisposable
     {
@@ -115,14 +120,33 @@ namespace P2PTransferLib
         /// </summary>
         public double ProgressIntervalMs { get; set; } = 500.0;
 
+        /// <summary>
+        /// 서버 접속 타임아웃 (밀리초 단위, 기본 5000ms = 5초)
+        /// </summary>
+        public int ConnectTimeoutMs { get; set; } = 5000;
+
         // 여러 개의 수신 작업(Receiver)을 자동으로 관리하는 스레드 안전 컬렉션 (Key: "{peerId}_{chId}_{msgId}")
         private readonly ConcurrentDictionary<string, P2PReceiverItem> _receiverMap = new ConcurrentDictionary<string, P2PReceiverItem>();
+
+        /// <summary>
+        /// 단순 로그 출력 이벤트
+        /// </summary>
+        public event Action<string> OnLog;
+
+        /// <summary>
+        /// 진행 상태 및 완료/취소/오류/파일없음(FileMissing) 이벤트
+        /// </summary>
+        public event EventHandler<TransferProgressEventArgs> OnProgress;
+
+        /// <summary>
+        /// 상세 오류 이벤트 (미등록 파일 요청, 네트워크 접속 실패, 잘못된 파라미터, 무결성 오류 등 발생 시 호출됨)
+        /// </summary>
+        public event EventHandler<P2PErrorEventArgs> OnError;
 
         /// <summary>
         /// [수신 파일 목록 조회 1]
         /// 현재 등록되어 관리 중인 모든 Receiver 목록을 리스트로 반환합니다.
         /// 조회 시 자동으로 완료된 파일의 디스크 존재 여부('파일없음')와 유효시간(30분) 만료 상태를 최신으로 갱신하여 반환합니다.
-        /// (chId를 지정하면 해당 채널의 수신 목록만 필터링 가능)
         /// </summary>
         public List<P2PReceiverItem> GetReceiverList(string chId = null)
         {
@@ -151,6 +175,32 @@ namespace P2PTransferLib
         }
 
         /// <summary>
+        /// 특정 (chId, msgId, peerId) 수신 항목을 목록에서 등록 해제(Unregister)합니다.
+        /// 진행 중인 경우 취소 후 목록에서 제거합니다.
+        /// </summary>
+        public bool UnregisterReceiver(string chId, string msgId, string peerId = null)
+        {
+            CancelDownload(chId, msgId, peerId);
+
+            int removedCount = 0;
+            foreach (var kv in _receiverMap.ToList())
+            {
+                var item = kv.Value;
+                if ((string.IsNullOrEmpty(chId) || item.ChId == chId.Trim()) &&
+                    (string.IsNullOrEmpty(msgId) || item.MsgId == msgId.Trim()) &&
+                    (string.IsNullOrEmpty(peerId) || item.PeerId == peerId.Trim()))
+                {
+                    if (_receiverMap.TryRemove(kv.Key, out _))
+                    {
+                        removedCount++;
+                        Log($"[수신 등록 해제(Unregister)] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' 수신 목록에서 제거됨.");
+                    }
+                }
+            }
+            return removedCount > 0;
+        }
+
+        /// <summary>
         /// 완료되었거나 취소된 Receiver 항목들을 목록에서 정리합니다.
         /// </summary>
         public void RemoveFinishedReceivers()
@@ -166,19 +216,180 @@ namespace P2PTransferLib
             }
         }
 
-        /// <summary>
-        /// 단순 로그 출력 이벤트
-        /// </summary>
-        public event Action<string> OnLog;
+        // =========================================================================
+        // [기존에 받다가 중지된 파일(.part)이 있는지 및 몇 퍼센트(%) 받았었는지 확인하는 API]
+        // =========================================================================
 
         /// <summary>
-        /// 진행 상태 및 완료/취소/오류 이벤트 (WaitingQueue, Transferring, Paused, Merging, Completed, Cancelled, Expired, Error, FileMissing)
+        /// [중지된 파일 퍼센트 확인 1 - 로컬 파일명/크기로 즉시 확인]
+        /// 다운로드 폴더와 파일명(및 전체 파일 크기)을 지정하면, 기존에 받다가 중지된 파일(.part)이 있는지와
+        /// 몇 퍼센트(SavedPercentage) 받았었는지 즉시 확인하여 반환합니다.
         /// </summary>
-        public event EventHandler<TransferProgressEventArgs> OnProgress;
+        public PartialDownloadCheckResult CheckPartialFileProgress(string downloadFolder, string fileName, long totalFileSize, int chunkSize = 64 * 1024)
+        {
+            var result = new PartialDownloadCheckResult
+            {
+                FileName = fileName,
+                TotalBytes = totalFileSize
+            };
+
+            if (string.IsNullOrWhiteSpace(downloadFolder) || string.IsNullOrWhiteSpace(fileName))
+            {
+                result.SummaryMessage = "다운로드 폴더 또는 파일명이 지정되지 않았습니다.";
+                return result;
+            }
+
+            try
+            {
+                if (chunkSize <= 0) chunkSize = 64 * 1024;
+                int totalChunks = totalFileSize > 0 ? (int)((totalFileSize + chunkSize - 1) / chunkSize) : 1;
+                result.TotalChunks = totalChunks;
+
+                string finalPath = Path.Combine(downloadFolder.Trim(), fileName.Trim());
+                string partPath = finalPath + ".part";
+                result.FinalFilePath = finalPath;
+                result.PartFilePath = partPath;
+
+                // 1) 받다가 중지된 .part 파일이 존재하는 경우
+                if (File.Exists(partPath))
+                {
+                    long partLen = new FileInfo(partPath).Length;
+                    int savedChunks = GetSavedChunkIndexFromPartFile(partPath, chunkSize, totalFileSize, totalChunks);
+                    long validSavedBytes = totalFileSize > 0 ? Math.Min(totalFileSize, (long)savedChunks * chunkSize) : partLen;
+                    double pct = totalFileSize > 0
+                        ? Math.Min(100.0, validSavedBytes * 100.0 / totalFileSize)
+                        : 0.0;
+
+                    result.HasPartialFile = true;
+                    result.SavedBytes = validSavedBytes;
+                    result.SavedChunkCount = savedChunks;
+                    result.SavedPercentage = pct;
+                    result.SummaryMessage = totalFileSize > 0
+                        ? $"[중지된 파일 발견] '{fileName}' -> 기존 수신 진행률: {pct:0.0}% ({savedChunks}/{totalChunks} 패킷, {P2PSenderNode.FormatBytes(validSavedBytes)} / {P2PSenderNode.FormatBytes(totalFileSize)}) - 이어받기 가능"
+                        : $"[중지된 파일 발견] '{fileName}' -> 기존 수신 용량: {P2PSenderNode.FormatBytes(partLen)} ({savedChunks} 패킷 완료) - 이어받기 가능";
+
+                    Log(result.SummaryMessage);
+                    return result;
+                }
+
+                // 2) 이미 최종 완료된 파일이 존재하는 경우
+                if (File.Exists(finalPath))
+                {
+                    long finalLen = new FileInfo(finalPath).Length;
+                    if (totalFileSize <= 0 || finalLen == totalFileSize)
+                    {
+                        result.IsAlreadyCompleted = true;
+                        result.SavedBytes = finalLen;
+                        result.SavedChunkCount = totalChunks;
+                        result.SavedPercentage = 100.0;
+                        result.SummaryMessage = $"[완료된 파일 존재] '{fileName}' 파일은 이미 100% ({P2PSenderNode.FormatBytes(finalLen)}) 다운로드 완료되어 있습니다.";
+                        Log(result.SummaryMessage);
+                        return result;
+                    }
+                }
+
+                // 3) 기존에 받던 파일이 없는 경우
+                result.HasPartialFile = false;
+                result.SavedPercentage = 0.0;
+                result.SummaryMessage = $"[신규 수신 대상] '{fileName}' -> 기존에 받다 중지된 파일(.part)이 없습니다. (0.0% 부터 새로 수신)";
+                Log(result.SummaryMessage);
+                return result;
+            }
+            catch (Exception ex)
+            {
+                result.SummaryMessage = $"중지된 파일 확인 중 오류 발생: {ex.Message}";
+                return result;
+            }
+        }
+
+        /// <summary>
+        /// [중지된 파일 퍼센트 확인 2 - 서버에 chID/msgID로 조회하여 로컬 중지 파일 퍼센트 확인]
+        /// 수신자가 파일명을 모르고 chID(채널ID)와 msgID(파일ID)만 지정했을 때,
+        /// 서버에서 파일 메타데이터(파일명, 전체 크기)를 조회한 뒤 로컬 폴더에 받다 중지된 .part 파일이 몇 퍼센트(%) 받아져 있는지 확인합니다.
+        /// </summary>
+        public async Task<PartialDownloadCheckResult> CheckPartialProgressFromServerAsync(
+            string serverIp, int serverPort, string peerId, string peerName, string chId, string msgId, string downloadFolder)
+        {
+            var result = new PartialDownloadCheckResult { ChId = chId, MsgId = msgId };
+
+            if (!ValidateConnectionParameters(serverIp, serverPort, peerId, peerName, chId, msgId, downloadFolder, out string validationError))
+            {
+                result.SummaryMessage = validationError;
+                return result;
+            }
+
+            // 먼저 현재 메모리 리스트(_receiverMap)에 등록된 항목이 있고 파일명을 이미 알고 있다면 즉시 로컬 확인
+            string taskKey = $"{peerId.Trim()}_{chId.Trim()}_{msgId.Trim()}";
+            if (_receiverMap.TryGetValue(taskKey, out var existingItem) && !string.IsNullOrEmpty(existingItem.FileName) && existingItem.FileSize > 0)
+            {
+                var localRes = CheckPartialFileProgress(downloadFolder, existingItem.FileName, existingItem.FileSize);
+                localRes.ChId = chId;
+                localRes.MsgId = msgId;
+                return localRes;
+            }
+
+            // 서버에 QueryMetaOnly 명령으로 파일명/전체크기를 물어봐서 로컬 .part 파일의 퍼센트 계산
+            using (var client = new TcpClient())
+            {
+                client.NoDelay = true;
+                try
+                {
+                    await ConnectWithTimeoutAsync(client, serverIp.Trim(), serverPort, ConnectTimeoutMs).ConfigureAwait(false);
+                    NetworkStream stream = client.GetStream();
+
+                    var hsReq = new HandshakeRequest
+                    {
+                        PeerId = peerId.Trim(),
+                        PeerName = peerName.Trim(),
+                        ChId = chId.Trim(),
+                        MsgId = msgId.Trim()
+                    };
+
+                    using (var cts = new CancellationTokenSource(ConnectTimeoutMs))
+                    {
+                        await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.QueryMetaOnly, 0, FrameStreamHelper.SerializeJson(hsReq), cts.Token).ConfigureAwait(false);
+                        P2PFrame ackFrame = await FrameStreamHelper.ReadFrameAsync(stream, cts.Token).ConfigureAwait(false);
+
+                        if (ackFrame == null)
+                        {
+                            result.SummaryMessage = "서버로부터 파일 정보 응답을 받지 못했습니다.";
+                            Log("[사전 조회 오류] " + result.SummaryMessage);
+                            return result;
+                        }
+
+                        if (ackFrame.Command == P2PCommand.Error)
+                        {
+                            ParseServerErrorAndNotify(ackFrame.GetPayloadText(), chId, msgId, peerId, peerName, out _, out string parsedMsg);
+                            result.SummaryMessage = parsedMsg;
+                            return result;
+                        }
+
+                        var meta = FrameStreamHelper.DeserializeJson<HandshakeResponse>(ackFrame.GetPayloadText());
+                        if (meta == null)
+                        {
+                            result.SummaryMessage = "서버 파일 메타데이터 파싱에 실패했습니다.";
+                            return result;
+                        }
+
+                        var checkRes = CheckPartialFileProgress(downloadFolder, meta.FileName, meta.FileSize, meta.ChunkSize);
+                        checkRes.ChId = chId;
+                        checkRes.MsgId = msgId;
+                        return checkRes;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    string errMsg = $"서버({serverIp}:{serverPort})에 접속하여 파일 정보를 확인할 수 없습니다: {ex.Message}";
+                    RaiseError(P2PErrorCode.ConnectionFailed, chId, msgId, peerId, peerName, errMsg, ex);
+                    result.SummaryMessage = errMsg;
+                    return result;
+                }
+            }
+        }
 
         /// <summary>
         /// 새로운 수신 작업(P2PReceiverItem)을 리스트에 자동 추가하고 백그라운드에서 다운로드를 시작합니다.
-        /// (peerID:사번, peerName:이름, chID:채널ID, msgID:파일ID 전송)
+        /// 잘못된 입력값(포트, IP, 빈 msgID, 잘못된 폴더 경로 등)이 들어와도 예외로 프로그램이 죽지 않고 상세 오류 메시지를 출력합니다.
         /// </summary>
         public Task<P2PReceiverItem> StartDownloadAsync(string serverIp, int serverPort, string peerId, string peerName, string chId, string msgId, string downloadFolder)
         {
@@ -186,17 +397,23 @@ namespace P2PTransferLib
             if (string.IsNullOrWhiteSpace(peerId)) peerId = "EMP_001";
             if (string.IsNullOrWhiteSpace(peerName)) peerName = "홍길동";
             if (string.IsNullOrWhiteSpace(chId)) chId = "DEFAULT_CH";
-            if (string.IsNullOrWhiteSpace(msgId))
-                throw new ArgumentException("요청할 파일ID(msgID)를 입력해야 합니다.");
-
             if (string.IsNullOrWhiteSpace(downloadFolder))
                 downloadFolder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Downloads");
 
-            string taskKey = $"{peerId.Trim()}_{chId.Trim()}_{msgId.Trim()}";
+            // 입력값 유효성 검증 (잘못된 값 입력 시 예외 대신 오류 메시지 출력 후 안전하게 반환)
+            if (!ValidateConnectionParameters(serverIp, serverPort, peerId, peerName, chId, msgId, downloadFolder, out _))
+            {
+                return Task.FromResult<P2PReceiverItem>(null);
+            }
 
-            // 이미 리스트에 존재하고 현재 활성 상태인 경우 확인
+            string normFolder = P2PFileWatchManager.NormalizePath(downloadFolder);
+            string taskKey = $"{peerId.Trim()}_{chId.Trim()}_{msgId.Trim()}_{normFolder}";
+
+            // 이미 리스트에 동일한 (peerId, chId, msgId, downloadFolder) 아이템이 존재하는지 중복 체크
             if (_receiverMap.TryGetValue(taskKey, out var existing))
             {
+                existing.RefreshStatus();
+
                 if (existing.IsPaused && existing.Stream != null)
                 {
                     existing.IsPaused = false;
@@ -207,7 +424,12 @@ namespace P2PTransferLib
                 }
                 else if (existing.Status == TransferStatus.WaitingQueue || existing.Status == TransferStatus.Transferring || existing.Status == TransferStatus.Merging)
                 {
-                    Log($"[알림] 사번:{peerId}({peerName}), chID:'{chId}', msgID:'{msgId}' 는 이미 수신 목록에서 진행 중입니다. (현재 활성 수신 수: {GetActiveReceiverList().Count}개)");
+                    Log($"[중복 수신 무시] 이미 동일한 항목(chID:'{chId}', msgID:'{msgId}', 폴더:'{normFolder}')이 수신 진행 중입니다.");
+                    return Task.FromResult(existing);
+                }
+                else if (existing.Status == TransferStatus.Completed && !string.IsNullOrEmpty(existing.SavedFilePath) && File.Exists(existing.SavedFilePath))
+                {
+                    Log($"[중복 수신 무시] 이미 동일한 항목(chID:'{chId}', msgID:'{msgId}', 경로:'{existing.SavedFilePath}')이 수신 완료되어 파일이 존재합니다.");
                     return Task.FromResult(existing);
                 }
             }
@@ -222,9 +444,10 @@ namespace P2PTransferLib
                 PeerName = peerName.Trim(),
                 ChId = chId.Trim(),
                 MsgId = msgId.Trim(),
+                DownloadFolder = normFolder,
                 Status = TransferStatus.WaitingQueue,
                 StartedTime = DateTime.Now,
-                ExpireTimeUtc = DateTime.UtcNow.AddMinutes(30), // 서버 응답 시 서버의 실제 ExpireTimeUtc로 업데이트됨
+                ExpireTimeUtc = DateTime.UtcNow.AddMinutes(30),
                 Cts = new CancellationTokenSource()
             };
 
@@ -232,8 +455,44 @@ namespace P2PTransferLib
             Log($"[수신 목록 등록] 사번:{newItem.PeerId}({newItem.PeerName}), chID:'{newItem.ChId}', msgID:'{newItem.MsgId}' 리스트 추가됨 (총 관리 목록:{_receiverMap.Count}개)");
 
             // 백그라운드 스레드에서 비동기 다운로드 시작 (UI 블로킹 없음)
-            _ = Task.Run(() => RunDownloadSessionAsync(newItem, downloadFolder));
+            _ = Task.Run(() => RunDownloadSessionAsync(newItem, newItem.DownloadFolder));
             return Task.FromResult(newItem);
+        }
+
+        private bool ValidateConnectionParameters(string serverIp, int serverPort, string peerId, string peerName, string chId, string msgId, string downloadFolder, out string errorMsg)
+        {
+            errorMsg = null;
+
+            if (string.IsNullOrWhiteSpace(msgId))
+            {
+                errorMsg = "요청할 파일ID(msgID)가 입력되지 않았습니다. 파일ID(msgID)를 입력해주세요.";
+                RaiseError(P2PErrorCode.InvalidParameter, chId, msgId, peerId, peerName, errorMsg);
+                return false;
+            }
+
+            if (serverPort <= 0 || serverPort > 65535)
+            {
+                errorMsg = $"잘못된 서버 포트 번호({serverPort})입니다. 포트 번호는 1 ~ 65535 사이여야 합니다.";
+                RaiseError(P2PErrorCode.InvalidParameter, chId, msgId, peerId, peerName, errorMsg);
+                return false;
+            }
+
+            string trimmedIp = (serverIp ?? "").Trim();
+            if (!trimmedIp.Equals("localhost", StringComparison.OrdinalIgnoreCase) && !IPAddress.TryParse(trimmedIp, out _))
+            {
+                errorMsg = $"잘못된 서버 IP 주소 형식('{serverIp}')입니다. 올바른 IP 주소(예: 127.0.0.1 또는 192.168.x.x)를 입력해주세요.";
+                RaiseError(P2PErrorCode.InvalidParameter, chId, msgId, peerId, peerName, errorMsg);
+                return false;
+            }
+
+            if (!string.IsNullOrWhiteSpace(downloadFolder) && downloadFolder.IndexOfAny(Path.GetInvalidPathChars()) >= 0)
+            {
+                errorMsg = $"다운로드 폴더 경로에 허용되지 않는 문자가 포함되어 있습니다: '{downloadFolder}'";
+                RaiseError(P2PErrorCode.InvalidParameter, chId, msgId, peerId, peerName, errorMsg);
+                return false;
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -251,7 +510,7 @@ namespace P2PTransferLib
                     item.IsPaused = true;
                     item.Status = TransferStatus.Paused;
                     _ = SendControlAsync(item, P2PCommand.Pause, item.CurrentChunkIndex);
-                    Log($"[일시정지] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' (패킷 {item.CurrentChunkIndex}/{item.TotalChunks} 저장됨)");
+                    Log($"[일시정지] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' (패킷 {item.CurrentChunkIndex}/{item.TotalChunks}, {item.ProgressPercentage:0.0}% 저장됨)");
                     RaiseProgress(item, 64 * 1024, TransferStatus.Paused, "일시정지됨", null);
                 }
             }
@@ -272,7 +531,7 @@ namespace P2PTransferLib
                     item.IsPaused = false;
                     item.Status = TransferStatus.Transferring;
                     _ = SendControlAsync(item, P2PCommand.Resume, item.CurrentChunkIndex);
-                    Log($"[재개 요청] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' (패킷 {item.CurrentChunkIndex}번부터 재개)");
+                    Log($"[재개 요청] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' (패킷 {item.CurrentChunkIndex}번, {item.ProgressPercentage:0.0}%부터 재개)");
                     RaiseProgress(item, 64 * 1024, TransferStatus.Transferring, "전송 재개됨", null);
                 }
             }
@@ -303,11 +562,69 @@ namespace P2PTransferLib
             }
         }
 
+        private async Task ConnectWithTimeoutAsync(TcpClient client, string host, int port, int timeoutMs)
+        {
+            var connectTask = client.ConnectAsync(host, port);
+            var delayTask = Task.Delay(timeoutMs);
+            var completed = await Task.WhenAny(connectTask, delayTask).ConfigureAwait(false);
+            if (completed != connectTask)
+            {
+                try { client.Close(); } catch { }
+                throw new TimeoutException($"서버({host}:{port}) 접속 응답 시간이 초과되었습니다({timeoutMs / 1000.0:0.#}초). 서버가 켜져 있는지 및 IP/포트를 확인해주세요.");
+            }
+            await connectTask.ConfigureAwait(false); // 연결 중 발생한 SocketException 전파
+        }
+
+        private void ParseServerErrorAndNotify(string rawServerError, string chId, string msgId, string peerId, string peerName, out P2PErrorCode errorCode, out string userFriendlyMessage)
+        {
+            if (string.IsNullOrEmpty(rawServerError))
+            {
+                errorCode = P2PErrorCode.ProtocolError;
+                userFriendlyMessage = "서버에서 알 수 없는 오류를 반환했습니다.";
+            }
+            else if (rawServerError.StartsWith("UNREGISTERED:"))
+            {
+                errorCode = P2PErrorCode.UnregisteredFileRequested;
+                userFriendlyMessage = rawServerError.Substring("UNREGISTERED:".Length);
+            }
+            else if (rawServerError.StartsWith("EXPIRED:"))
+            {
+                errorCode = P2PErrorCode.FileExpired;
+                userFriendlyMessage = rawServerError.Substring("EXPIRED:".Length);
+            }
+            else if (rawServerError.StartsWith("FILE_MISSING:"))
+            {
+                errorCode = P2PErrorCode.SourceFileNotFound;
+                userFriendlyMessage = rawServerError.Substring("FILE_MISSING:".Length);
+            }
+            else
+            {
+                errorCode = P2PErrorCode.ProtocolError;
+                userFriendlyMessage = rawServerError;
+            }
+
+            RaiseError(errorCode, chId, msgId, peerId, peerName, userFriendlyMessage);
+        }
+
         private async Task RunDownloadSessionAsync(P2PReceiverItem item, string downloadFolder)
         {
-            if (!Directory.Exists(downloadFolder))
+            // 0. 다운로드 폴더 생성 및 디스크 접근 권한 검증
+            try
             {
-                Directory.CreateDirectory(downloadFolder);
+                if (!Directory.Exists(downloadFolder))
+                {
+                    Directory.CreateDirectory(downloadFolder);
+                }
+            }
+            catch (Exception dirEx)
+            {
+                string errMsg = $"다운로드 폴더('{downloadFolder}')를 생성하거나 접근할 수 없습니다: {dirEx.Message}";
+                item.Status = TransferStatus.Error;
+                item.LastErrorCode = P2PErrorCode.DiskAccessError;
+                item.LastErrorMessage = errMsg;
+                RaiseError(P2PErrorCode.DiskAccessError, item.ChId, item.MsgId, item.PeerId, item.PeerName, errMsg, dirEx);
+                RaiseProgress(item, 64 * 1024, TransferStatus.Error, errMsg, null, P2PErrorCode.DiskAccessError);
+                return;
             }
 
             CancellationToken ct = item.Cts.Token;
@@ -320,7 +637,22 @@ namespace P2PTransferLib
                 try
                 {
                     Log($"[연결 시도] 서버({item.ServerIp}:{item.ServerPort}) 접속 중... (사번:{item.PeerId}, 이름:{item.PeerName}, chID:{item.ChId}, msgID:{item.MsgId})");
-                    await client.ConnectAsync(item.ServerIp, item.ServerPort).ConfigureAwait(false);
+
+                    try
+                    {
+                        await ConnectWithTimeoutAsync(client, item.ServerIp, item.ServerPort, ConnectTimeoutMs).ConfigureAwait(false);
+                    }
+                    catch (Exception connEx)
+                    {
+                        string connErrMsg = $"송신자 서버({item.ServerIp}:{item.ServerPort})에 네트워크 접속을 할 수 없습니다. 서버가 시작(포트 오픈)되었는지, IP 주소와 포트 번호가 맞는지 확인해주세요. ({connEx.Message})";
+                        item.Status = TransferStatus.Error;
+                        item.LastErrorCode = P2PErrorCode.ConnectionFailed;
+                        item.LastErrorMessage = connErrMsg;
+                        RaiseError(P2PErrorCode.ConnectionFailed, item.ChId, item.MsgId, item.PeerId, item.PeerName, connErrMsg, connEx);
+                        RaiseProgress(item, chunkSize, TransferStatus.Error, connErrMsg, null, P2PErrorCode.ConnectionFailed);
+                        return;
+                    }
+
                     NetworkStream stream = client.GetStream();
                     item.Stream = stream;
 
@@ -334,27 +666,31 @@ namespace P2PTransferLib
                     };
                     await FrameStreamHelper.WriteControlFrameAsync(stream, P2PCommand.Handshake, 0, FrameStreamHelper.SerializeJson(hsReq), ct).ConfigureAwait(false);
 
-                    // 2. 서버로부터 파일 메타데이터(HandshakeAck) 또는 Error 수신
+                    // 2. 서버로부터 파일 메타데이터(HandshakeAck) 또는 Error(미등록 파일, 유효시간 만료, 원본파일 없음 등) 수신
                     P2PFrame ackFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
                     if (ackFrame == null)
-                        throw new IOException("서버로부터 응답이 없습니다.");
+                        throw new IOException("서버로부터 초기 응답(HandshakeAck)을 받지 못하고 연결이 종료되었습니다.");
 
                     if (ackFrame.Command == P2PCommand.Error)
                     {
-                        string errMsg = ackFrame.GetPayloadText();
-                        bool isExpired = errMsg.StartsWith("EXPIRED:");
-                        item.Status = isExpired ? TransferStatus.Expired : TransferStatus.Error;
-                        if (isExpired) item.ExpireTimeUtc = DateTime.UtcNow.AddSeconds(-1);
-                        Log($"[서버 거부] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' -> {errMsg}");
-                        RaiseProgress(item, chunkSize, item.Status, errMsg, null);
+                        ParseServerErrorAndNotify(ackFrame.GetPayloadText(), item.ChId, item.MsgId, item.PeerId, item.PeerName,
+                            out P2PErrorCode errCode, out string friendlyErrMsg);
+
+                        item.LastErrorCode = errCode;
+                        item.LastErrorMessage = friendlyErrMsg;
+                        item.Status = errCode == P2PErrorCode.FileExpired ? TransferStatus.Expired : TransferStatus.Error;
+                        if (errCode == P2PErrorCode.FileExpired) item.ExpireTimeUtc = DateTime.UtcNow.AddSeconds(-1);
+
+                        RaiseProgress(item, chunkSize, item.Status, friendlyErrMsg, null, errCode);
                         return;
                     }
 
                     if (ackFrame.Command != P2PCommand.HandshakeAck)
                     {
+                        string protoErr = $"예상치 못한 서버 프로토콜 응답({ackFrame.Command})입니다.";
                         item.Status = TransferStatus.Error;
-                        Log($"[프로토콜 오류] 예상치 못한 응답({ackFrame.Command})");
-                        RaiseProgress(item, chunkSize, TransferStatus.Error, "프로토콜 응답 오류", null);
+                        RaiseError(P2PErrorCode.ProtocolError, item.ChId, item.MsgId, item.PeerId, item.PeerName, protoErr);
+                        RaiseProgress(item, chunkSize, TransferStatus.Error, protoErr, null, P2PErrorCode.ProtocolError);
                         return;
                     }
 
@@ -370,22 +706,33 @@ namespace P2PTransferLib
                     }
                     chunkSize = fileMeta.ChunkSize > 0 ? fileMeta.ChunkSize : 64 * 1024;
 
-                    // 원래 파일명 그대로 저장하기 위한 경로 설정 (다운로드 중에는 "원래파일명.part" 사용, .idx 파일 불필요!)
+                    // 원래 파일명 그대로 저장하기 위한 경로 설정 (다운로드 중에는 "원래파일명.part" 사용)
                     string finalFilePath = Path.Combine(downloadFolder, item.FileName);
                     partFilePath = finalFilePath + ".part";
+                    item.PartFilePath = partFilePath;
+                    item.SavedFilePath = finalFilePath;
+                    item.IsMissingNotified = false;
 
-                    // 패킷 크기(chunkSize = 64KB)가 일정하므로, 기존 .part 파일의 크기만 보면 몇 번 패킷까지 받았는지 즉시 계산 가능 (.idx 파일 제거)
-                    int startChunk = GetSavedChunkIndexFromPartFile(partFilePath, chunkSize, item.FileSize, item.TotalChunks);
+                    // 기존에 받다가 중지된 파일(.part)이 있는지 및 몇 퍼센트 받았었는지 확인
+                    var partialInfo = CheckPartialFileProgress(downloadFolder, item.FileName, item.FileSize, chunkSize);
+                    int startChunk = partialInfo.HasPartialFile ? partialInfo.SavedChunkCount : 0;
                     item.CurrentChunkIndex = startChunk;
 
-                    Log($"[파일 확인] chID:'{item.ChId}', msgID:'{item.MsgId}' -> 파일명:'{item.FileName}', 크기:{P2PSenderNode.FormatBytes(item.FileSize)}, 총 {item.TotalChunks}패킷 (유효시간:{item.RemainingValidTimeText}, 시작패킷:{startChunk}번)");
+                    if (partialInfo.HasPartialFile && startChunk > 0)
+                    {
+                        Log($"[이어받기 감지] '{item.FileName}' 기존에 받다 중지된 파일이 있습니다! (기존 수신률: {partialInfo.SavedPercentage:0.0}%, {startChunk}/{item.TotalChunks} 패킷 완료 -> {startChunk + 1}번째 패킷부터 이어받기)");
+                    }
+                    else
+                    {
+                        Log($"[파일 확인] chID:'{item.ChId}', msgID:'{item.MsgId}' -> 파일명:'{item.FileName}', 크기:{P2PSenderNode.FormatBytes(item.FileSize)}, 총 {item.TotalChunks}패킷 (유효시간:{item.RemainingValidTimeText})");
+                    }
 
                     // 3. 대기열(WaitQueue) 또는 시작 승인(QueueReady) 수신 대기
                     while (true)
                     {
                         P2PFrame qFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
                         if (qFrame == null)
-                            throw new IOException("대기 중 서버 연결이 끊어졌습니다.");
+                            throw new IOException("대기열 대기 중 송신자 서버와의 연결이 끊어졌습니다.");
 
                         if (qFrame.Command == P2PCommand.WaitQueue)
                         {
@@ -397,20 +744,19 @@ namespace P2PTransferLib
                         else if (qFrame.Command == P2PCommand.QueueReady)
                         {
                             item.Status = TransferStatus.Transferring;
-                            Log($"[수신 시작] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' ({item.FileName}) 패킷 요청을 시작합니다.");
+                            Log($"[수신 시작] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' ({item.FileName}) 패킷 요청을 시작합니다. (시작 진행률:{item.ProgressPercentage:0.0}%)");
                             break;
                         }
                         else if (qFrame.Command == P2PCommand.Cancel)
                         {
                             item.IsCancelled = true;
-                            throw new OperationCanceledException("서버에 의해 취소됨");
+                            throw new OperationCanceledException("송신자 서버에 의해 전송이 취소되었습니다.");
                         }
                         else if (qFrame.Command == P2PCommand.Error)
                         {
-                            string err = qFrame.GetPayloadText();
+                            ParseServerErrorAndNotify(qFrame.GetPayloadText(), item.ChId, item.MsgId, item.PeerId, item.PeerName, out P2PErrorCode ec, out string em);
                             item.Status = TransferStatus.Error;
-                            Log($"[오류] {err}");
-                            RaiseProgress(item, chunkSize, TransferStatus.Error, err, null);
+                            RaiseProgress(item, chunkSize, TransferStatus.Error, em, null, ec);
                             return;
                         }
                     }
@@ -445,7 +791,7 @@ namespace P2PTransferLib
                             {
                                 dataFrame = await FrameStreamHelper.ReadFrameAsync(stream, ct).ConfigureAwait(false);
                                 if (dataFrame == null)
-                                    throw new IOException("패킷 수신 중 서버 연결이 끊어졌습니다.");
+                                    throw new IOException("패킷 수신 도중 송신자 서버와의 네트워크 연결이 끊어졌습니다.");
 
                                 if (dataFrame.Command == P2PCommand.DataChunk)
                                 {
@@ -458,7 +804,7 @@ namespace P2PTransferLib
                                 }
                                 else if (dataFrame.Command == P2PCommand.Error)
                                 {
-                                    throw new IOException("서버 오류: " + dataFrame.GetPayloadText());
+                                    throw new IOException("서버 오류 응답: " + dataFrame.GetPayloadText());
                                 }
                             }
 
@@ -469,7 +815,9 @@ namespace P2PTransferLib
                             byte[] actualSha256 = ChunkSecurityHelper.ComputeSha256(decrypted, 0, decrypted.Length);
                             if (!ChunkSecurityHelper.VerifyHash(dataFrame.Hash, actualSha256))
                             {
-                                throw new InvalidDataException($"패킷 #{dataFrame.ChunkIndex} SHA-256 무결성 검증 실패!");
+                                string hashErr = $"패킷 #{dataFrame.ChunkIndex} 데이터 무결성(SHA-256) 검증에 실패했습니다! 네트워크 데이터 손상이 의심됩니다.";
+                                RaiseError(P2PErrorCode.IntegrityCheckFailed, item.ChId, item.MsgId, item.PeerId, item.PeerName, hashErr);
+                                throw new InvalidDataException(hashErr);
                             }
 
                             if (decrypted.Length > 0)
@@ -531,8 +879,9 @@ namespace P2PTransferLib
                         int saved = GetSavedChunkIndexFromPartFile(partFilePath, chunkSize, item.FileSize, item.TotalChunks);
                         item.CurrentChunkIndex = saved;
                         item.Status = TransferStatus.Error;
-                        Log($"[연결 중단] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' ({saved}번 패킷까지 보관됨 - 다시 수신 누르면 이어받기)");
-                        RaiseProgress(item, chunkSize, TransferStatus.Error, "연결 중단 (이어받기 대기)", null);
+                        string cancelMsg = $"연결이 중단되었습니다. (현재까지 받은 진행률: {item.ProgressPercentage:0.0}%, {saved}/{item.TotalChunks} 패킷 보관됨 - 다시 수신을 누르면 이어받기됩니다)";
+                        RaiseError(P2PErrorCode.NetworkDisconnected, item.ChId, item.MsgId, item.PeerId, item.PeerName, cancelMsg);
+                        RaiseProgress(item, chunkSize, TransferStatus.Error, cancelMsg, null, P2PErrorCode.NetworkDisconnected);
                     }
                 }
                 catch (Exception ex)
@@ -549,8 +898,12 @@ namespace P2PTransferLib
                         int saved = GetSavedChunkIndexFromPartFile(partFilePath, chunkSize, item.FileSize, item.TotalChunks);
                         item.CurrentChunkIndex = saved;
                         item.Status = TransferStatus.Error;
-                        Log($"[수신 오류] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' - {ex.Message} ({saved}번 패킷까지 보관됨 - 다시 수신 누르면 이어받기)");
-                        RaiseProgress(item, chunkSize, TransferStatus.Error, ex.Message, null);
+                        P2PErrorCode errCode = ex is InvalidDataException ? P2PErrorCode.IntegrityCheckFailed : P2PErrorCode.NetworkDisconnected;
+                        string errMsg = $"수신 중 오류 발생: {ex.Message} (현재까지 받은 진행률: {item.ProgressPercentage:0.0}%, {saved}/{item.TotalChunks} 패킷 보관됨 - 다시 수신을 누르면 이어받기됩니다)";
+                        item.LastErrorCode = errCode;
+                        item.LastErrorMessage = errMsg;
+                        RaiseError(errCode, item.ChId, item.MsgId, item.PeerId, item.PeerName, errMsg, ex);
+                        RaiseProgress(item, chunkSize, TransferStatus.Error, errMsg, null, errCode);
                     }
                 }
                 finally
@@ -617,7 +970,22 @@ namespace P2PTransferLib
             OnLog?.Invoke($"[{DateTime.Now:HH:mm:ss.fff}] {msg}");
         }
 
-        private void RaiseProgress(P2PReceiverItem item, int chunkSize, TransferStatus status, string message, string savedPath)
+        private void RaiseError(P2PErrorCode code, string chId, string msgId, string peerId, string peerName, string errorMessage, Exception ex = null)
+        {
+            Log($"[오류 - {code}] {errorMessage}");
+            OnError?.Invoke(this, new P2PErrorEventArgs
+            {
+                ErrorCode = code,
+                ChId = chId,
+                MsgId = msgId,
+                PeerId = peerId,
+                PeerName = peerName,
+                ErrorMessage = errorMessage,
+                Exception = ex
+            });
+        }
+
+        private void RaiseProgress(P2PReceiverItem item, int chunkSize, TransferStatus status, string message, string savedPath, P2PErrorCode errorCode = P2PErrorCode.None)
         {
             long transferred = Math.Min(item.FileSize, (long)item.CurrentChunkIndex * chunkSize);
             OnProgress?.Invoke(this, new TransferProgressEventArgs
@@ -634,6 +1002,7 @@ namespace P2PTransferLib
                 TransferredBytes = transferred,
                 TotalBytes = item.FileSize,
                 Status = status,
+                ErrorCode = errorCode,
                 ExpireTimeUtc = item.ExpireTimeUtc,
                 Message = message,
                 SavedFilePath = savedPath

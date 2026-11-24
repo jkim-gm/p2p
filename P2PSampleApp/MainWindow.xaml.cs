@@ -18,6 +18,9 @@ namespace P2PSampleApp
         // 2. 수신자(Receiver) 매니저는 여러 수신 작업(P2PReceiverItem)을 내부 리스트로 자동 추가/관리
         private readonly P2PReceiverNode _receiverManager = P2PReceiverNode.Instance;
 
+        // 3. 파일 삭제/복구 감시(FileSystemWatcher) 전용 독립 매니저 클래스
+        private readonly P2PFileWatchManager _fileWatcher = P2PFileWatchManager.Instance;
+
         public MainWindow()
         {
             InitializeComponent();
@@ -55,7 +58,33 @@ namespace P2PSampleApp
                     {
                         AppendReceiverLog($"   -> [OnProgress] 상태={e.Status} | 사번={e.PeerId}({e.PeerName}) | chID={e.ChId}, msgID={e.MsgId} | 진행률={e.ProgressPercentage:0.0}% ({e.CurrentChunkIndex}/{e.TotalChunks}) | 남은유효시간={e.RemainingValidTime:mm\\:ss} | {e.Message}");
                     }));
+
+                    // 수신 완료 시 독립된 Watch 클래스(P2PFileWatchManager)에 해당 파일을 등록하여 삭제 여부 감시
+                    if (e.Status == TransferStatus.Completed && !string.IsNullOrEmpty(e.SavedFilePath))
+                    {
+                        _fileWatcher.RegisterWatch(e.ChId, e.MsgId, e.SavedFilePath, "Receiver");
+                    }
                 }
+            };
+
+            // 독립된 파일 감시 클래스(P2PFileWatchManager) 이벤트 연결
+            _fileWatcher.OnLog += msg =>
+            {
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    AppendSenderLog(msg);
+                    AppendReceiverLog(msg);
+                }));
+            };
+
+            _fileWatcher.OnFileMissing += (s, e) =>
+            {
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    string alert = $"   -> [P2PFileWatchManager.OnFileMissing 이벤트] 상태={e.Status} | chID={e.ChId}, msgID={e.MsgId} ({e.FileName}) | {e.Message}";
+                    AppendSenderLog(alert);
+                    AppendReceiverLog(alert);
+                }));
             };
 
             AppendSenderLog("=== [안내] 1. '서버 시작(포트 오픈)' 클릭 -> 2. '파일 + chID/msgID 등록' 클릭 ===");
@@ -112,19 +141,27 @@ namespace P2PSampleApp
 
         private void BtnRegisterFile_Click(object sender, RoutedEventArgs e)
         {
-            try
-            {
-                string chId = TxtRegisterChId.Text.Trim();
-                string msgId = TxtRegisterMsgId.Text.Trim();
-                string filePath = TxtRegisterFilePath.Text.Trim();
+            string chId = TxtRegisterChId.Text.Trim();
+            string msgId = TxtRegisterMsgId.Text.Trim();
+            string filePath = TxtRegisterFilePath.Text.Trim();
 
-                // 파일과 채널ID(chID), 파일ID(msgID)를 송신 서버에 등록
-                _sender.RegisterFile(chId, msgId, filePath);
-            }
-            catch (Exception ex)
+            // 없는 파일이나 잘못된 값, 또는 (chId, msgId, filePath)가 동일한 중복 아이템이면 false 반환
+            if (_sender.TryRegisterFile(chId, msgId, filePath, out var item, out _))
             {
-                AppendSenderLog("[등록 오류] " + ex.Message);
+                // 독립된 Watch 매니저에 감시 등록
+                _fileWatcher.RegisterWatch(item.ChId, item.MsgId, item.LocalSourcePath, "Sender");
             }
+        }
+
+        private void BtnUnregisterFile_Click(object sender, RoutedEventArgs e)
+        {
+            string chId = TxtRegisterChId.Text.Trim();
+            string msgId = TxtRegisterMsgId.Text.Trim();
+            string filePath = TxtRegisterFilePath.Text.Trim();
+
+            // 송신 파일 등록 해제 (UnregisterFile) 및 독립 Watch 해제 (UnregisterWatch)
+            _sender.UnregisterFile(chId, msgId);
+            _fileWatcher.UnregisterWatch(chId, msgId, string.IsNullOrWhiteSpace(filePath) ? null : filePath);
         }
 
         private void BtnCreateDummyAndRegister_Click(object sender, RoutedEventArgs e)
@@ -147,7 +184,11 @@ namespace P2PSampleApp
                     string file = Path.Combine(sampleDir, $"SampleData_{i}.bin");
                     CreateDummyFile(file, 1536 * 1024); // 각 1.5MB (24패킷)
                     if (i == 1) TxtRegisterFilePath.Text = file;
-                    _sender.RegisterFile(chId, $"MSG_100{i}", file);
+
+                    if (_sender.TryRegisterFile(chId, $"MSG_100{i}", file, out var item, out _))
+                    {
+                        _fileWatcher.RegisterWatch(item.ChId, item.MsgId, item.LocalSourcePath, "Sender");
+                    }
                 }
             }
             catch (Exception ex)
@@ -191,6 +232,24 @@ namespace P2PSampleApp
             _sender.CancelTransfer(TxtRegisterChId.Text.Trim(), TxtRegisterMsgId.Text.Trim());
         }
 
+        private void BtnDeleteSenderFileTest_Click(object sender, RoutedEventArgs e)
+        {
+            string chId = TxtRegisterChId.Text.Trim();
+            string msgId = TxtRegisterMsgId.Text.Trim();
+            var list = _sender.GetRegisteredFiles(chId);
+            var target = list.Find(x => x.MsgId == msgId) ?? (list.Count > 0 ? list[0] : null);
+
+            if (target != null && File.Exists(target.LocalSourcePath))
+            {
+                File.Delete(target.LocalSourcePath);
+                // FileSystemWatcher 및 1초 백그라운드 타이머가 자동으로 파일 삭제를 감지하여 OnFileWatchAlert & 로그를 출력함
+            }
+            else
+            {
+                AppendSenderLog("[안내] 삭제 테스트할 등록된 원본 파일이 존재하지 않습니다.");
+            }
+        }
+
         private void BtnClearSenderLog_Click(object sender, RoutedEventArgs e)
         {
             TxtSenderLog.Clear();
@@ -202,23 +261,37 @@ namespace P2PSampleApp
 
         private void BtnStartReceive_Click(object sender, RoutedEventArgs e)
         {
-            try
-            {
-                string serverIp = TxtTargetServerIp.Text.Trim();
-                int serverPort = int.TryParse(TxtTargetServerPort.Text.Trim(), out int p) ? p : 9002;
-                string peerId = TxtPeerId.Text.Trim();       // 사번
-                string peerName = TxtPeerName.Text.Trim();   // 이름
-                string chId = TxtRequestChId.Text.Trim();    // 채널ID (chID)
-                string msgId = TxtRequestMsgId.Text.Trim();  // 파일ID (msgID)
-                string folder = TxtDownloadFolder.Text.Trim();
+            string serverIp = TxtTargetServerIp.Text.Trim();
+            int serverPort = int.TryParse(TxtTargetServerPort.Text.Trim(), out int p) ? p : -1;
+            string peerId = TxtPeerId.Text.Trim();       // 사번
+            string peerName = TxtPeerName.Text.Trim();   // 이름
+            string chId = TxtRequestChId.Text.Trim();    // 채널ID (chID)
+            string msgId = TxtRequestMsgId.Text.Trim();  // 파일ID (msgID)
+            string folder = TxtDownloadFolder.Text.Trim();
 
-                // 호출할 때마다 P2PReceiverItem이 생성되어 내부 리스트에 자동 등록되고 백그라운드로 동시 다운로드됨
-                _ = _receiverManager.StartDownloadAsync(serverIp, serverPort, peerId, peerName, chId, msgId, folder);
-            }
-            catch (Exception ex)
-            {
-                AppendReceiverLog("[수신 요청 오류] " + ex.Message);
-            }
+            // 잘못된 포트/IP, 미등록 msgID, 네트워크 미연결 등 모든 오류가 내부에서 안전하게 처리되고 로그로 출력됨
+            _ = _receiverManager.StartDownloadAsync(serverIp, serverPort, peerId, peerName, chId, msgId, folder);
+        }
+
+        /// <summary>
+        /// [기존에 받다가 중지된 파일이 있다면 몇 퍼센트 받았었는지 확인하는 코드]
+        /// 수신 시작을 누르기 전이라도 지정한 chID/msgID(또는 파일명)에 대해 로컬에 받다 중지된 .part 파일이 있는지,
+        /// 몇 퍼센트(SavedPercentage) 받았었는지 즉시 확인합니다.
+        /// </summary>
+        private async void BtnCheckPartialProgress_Click(object sender, RoutedEventArgs e)
+        {
+            string serverIp = TxtTargetServerIp.Text.Trim();
+            int serverPort = int.TryParse(TxtTargetServerPort.Text.Trim(), out int p) ? p : -1;
+            string peerId = TxtPeerId.Text.Trim();
+            string peerName = TxtPeerName.Text.Trim();
+            string chId = TxtRequestChId.Text.Trim();
+            string msgId = TxtRequestMsgId.Text.Trim();
+            string folder = TxtDownloadFolder.Text.Trim();
+
+            PartialDownloadCheckResult check = await _receiverManager.CheckPartialProgressFromServerAsync(
+                serverIp, serverPort, peerId, peerName, chId, msgId, folder);
+
+            AppendReceiverLog($"   -> [사전 확인 결과] 파일명:{check.FileName ?? "(미확인)"} | 중지된파일존재:{check.HasPartialFile} | 기존진행률:{check.SavedPercentage:0.0}% ({check.SavedChunkCount}/{check.TotalChunks} 패킷) | {check.SummaryMessage}");
         }
 
         private void BtnTestMultiConcurrentReceive_Click(object sender, RoutedEventArgs e)
@@ -274,6 +347,30 @@ namespace P2PSampleApp
             _receiverManager.CancelDownload(TxtRequestChId.Text.Trim(), TxtRequestMsgId.Text.Trim(), TxtPeerId.Text.Trim());
         }
 
+        private void BtnDeleteReceivedFileTest_Click(object sender, RoutedEventArgs e)
+        {
+            var list = _receiverManager.GetReceiverList();
+            var target = list.Find(x => !string.IsNullOrEmpty(x.SavedFilePath) && File.Exists(x.SavedFilePath))
+                      ?? list.Find(x => !string.IsNullOrEmpty(x.PartFilePath) && File.Exists(x.PartFilePath));
+
+            if (target != null)
+            {
+                if (!string.IsNullOrEmpty(target.SavedFilePath) && File.Exists(target.SavedFilePath))
+                {
+                    File.Delete(target.SavedFilePath);
+                }
+                else if (!string.IsNullOrEmpty(target.PartFilePath) && File.Exists(target.PartFilePath))
+                {
+                    File.Delete(target.PartFilePath);
+                }
+                // FileSystemWatcher 및 1초 백그라운드 타이머가 자동으로 파일 삭제를 감지하여 OnFileWatchAlert & 로그를 출력함
+            }
+            else
+            {
+                AppendReceiverLog("[안내] 삭제 테스트할 수신 완료된 파일(또는 중지된 .part 파일)이 없습니다.");
+            }
+        }
+
         private void BtnClearReceiverLog_Click(object sender, RoutedEventArgs e)
         {
             TxtReceiverLog.Clear();
@@ -293,6 +390,7 @@ namespace P2PSampleApp
 
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
         {
+            _fileWatcher.Dispose();
             _receiverManager.Dispose();
             _sender.Dispose();
         }

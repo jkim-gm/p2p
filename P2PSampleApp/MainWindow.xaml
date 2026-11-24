@@ -62,16 +62,18 @@
                             <Button Content="찾기..." Click="BtnBrowseFile_Click" Padding="6,2"/>
                         </WrapPanel>
                         <WrapPanel>
-                            <Button Content="파일 + chID/msgID 등록" Click="BtnRegisterFile_Click" Padding="10,4" Margin="0,0,6,0" FontWeight="Bold"/>
-                            <Button Content="테스트용 더미 파일(MSG_1001, MSG_1002) 자동생성 및 등록" Click="BtnCreateDummyAndRegister_Click" Padding="8,4"/>
+                            <Button Content="파일 + chID/msgID 등록 (Register)" Click="BtnRegisterFile_Click" Padding="8,4" Margin="0,0,4,0" FontWeight="Bold"/>
+                            <Button Content="등록 해제 (Unregister)" Click="BtnUnregisterFile_Click" Padding="8,4" Margin="0,0,4,0"/>
+                            <Button Content="더미 파일 5개 생성/등록" Click="BtnCreateDummyAndRegister_Click" Padding="8,4"/>
                         </WrapPanel>
                     </StackPanel>
                 </Border>
 
                 <!-- 송신 목록 조회 및 제어 버튼 -->
                 <WrapPanel Grid.Row="3" Margin="0,0,0,8" VerticalAlignment="Center">
-                    <Button Content="송신파일 목록 조회 (상태 / 유효시간 확인)" Click="BtnShowSenderList_Click" Padding="8,3" Margin="0,0,6,0" FontWeight="Bold"/>
-                    <Button Content="현재 chID+msgID 송신취소" Click="BtnCancelSenderTransfer_Click" Padding="8,3" Margin="0,0,6,0"/>
+                    <Button Content="송신파일 목록 조회 (상태 / 유효시간)" Click="BtnShowSenderList_Click" Padding="8,3" Margin="0,0,4,0" FontWeight="Bold"/>
+                    <Button Content="현재 chID+msgID 송신취소" Click="BtnCancelSenderTransfer_Click" Padding="6,3" Margin="0,0,4,0"/>
+                    <Button Content="송신원본 삭제(Watch 테스트)" Click="BtnDeleteSenderFileTest_Click" Padding="6,3" Margin="0,0,4,0"/>
                     <Button Content="로그 지우기" Click="BtnClearSenderLog_Click" Padding="6,3"/>
                 </WrapPanel>
 
@@ -119,18 +121,20 @@
                         </WrapPanel>
 
                         <WrapPanel>
-                            <Button Content="수신 시작 (추가 다운로드 가능)" Click="BtnStartReceive_Click" Padding="12,5" Margin="0,0,6,0" FontWeight="Bold"/>
-                            <Button Content="5명 동시 수신 요청 테스트(동시제한/대기열 확인)" Click="BtnTestMultiConcurrentReceive_Click" Padding="8,5"/>
+                            <Button Content="수신 시작 (추가 다운로드 가능)" Click="BtnStartReceive_Click" Padding="10,5" Margin="0,0,6,0" FontWeight="Bold"/>
+                            <Button Content="중지된 파일(%) 사전 확인" Click="BtnCheckPartialProgress_Click" Padding="8,5" Margin="0,0,6,0" FontWeight="Bold"/>
+                            <Button Content="5명 동시 수신 요청 테스트(대기열 확인)" Click="BtnTestMultiConcurrentReceive_Click" Padding="8,5"/>
                         </WrapPanel>
                     </StackPanel>
                 </Border>
 
                 <!-- 수신 목록 조회 및 일시정지 / 재개 / 취소 제어 버튼 -->
                 <WrapPanel Grid.Row="1" Margin="0,0,0,8" VerticalAlignment="Center">
-                    <Button Content="수신목록 조회 (상태 / 유효시간 확인)" Click="BtnShowReceiverList_Click" Padding="8,3" Margin="0,0,6,0" FontWeight="Bold"/>
-                    <Button Content="일시정지" Click="BtnPauseReceive_Click" Padding="8,3" Margin="0,0,4,0"/>
-                    <Button Content="재개(Resume)" Click="BtnResumeReceive_Click" Padding="8,3" Margin="0,0,4,0"/>
-                    <Button Content="수신취소" Click="BtnCancelReceive_Click" Padding="8,3" Margin="0,0,6,0"/>
+                    <Button Content="수신목록 조회 (상태 / 유효시간)" Click="BtnShowReceiverList_Click" Padding="8,3" Margin="0,0,4,0" FontWeight="Bold"/>
+                    <Button Content="일시정지" Click="BtnPauseReceive_Click" Padding="6,3" Margin="0,0,4,0"/>
+                    <Button Content="재개(Resume)" Click="BtnResumeReceive_Click" Padding="6,3" Margin="0,0,4,0"/>
+                    <Button Content="수신취소" Click="BtnCancelReceive_Click" Padding="6,3" Margin="0,0,4,0"/>
+                    <Button Content="수신파일 삭제(Watch 테스트)" Click="BtnDeleteReceivedFileTest_Click" Padding="6,3" Margin="0,0,4,0"/>
                     <Button Content="로그 지우기" Click="BtnClearReceiverLog_Click" Padding="6,3"/>
                 </WrapPanel>
 
