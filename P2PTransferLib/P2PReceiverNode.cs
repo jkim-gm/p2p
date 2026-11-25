@@ -246,8 +246,10 @@ namespace P2PTransferLib
                 int totalChunks = totalFileSize > 0 ? (int)((totalFileSize + chunkSize - 1) / chunkSize) : 1;
                 result.TotalChunks = totalChunks;
 
-                string finalPath = Path.Combine(downloadFolder.Trim(), fileName.Trim());
+                SplitDirectoryAndFileName(downloadFolder, fileName, out string actualDir, out string actualFileName);
+                string finalPath = Path.Combine(actualDir, actualFileName);
                 string partPath = finalPath + ".part";
+                result.FileName = actualFileName;
                 result.FinalFilePath = finalPath;
                 result.PartFilePath = partPath;
 
@@ -603,27 +605,8 @@ namespace P2PTransferLib
             RaiseError(errorCode, chId, msgId, peerId, peerName, userFriendlyMessage);
         }
 
-        private async Task RunDownloadSessionAsync(P2PReceiverItem item, string downloadFolder)
+        private async Task RunDownloadSessionAsync(P2PReceiverItem item, string savePathOrFolder)
         {
-            // 0. 다운로드 폴더 생성 및 디스크 접근 권한 검증
-            try
-            {
-                if (!Directory.Exists(downloadFolder))
-                {
-                    Directory.CreateDirectory(downloadFolder);
-                }
-            }
-            catch (Exception dirEx)
-            {
-                string errMsg = $"다운로드 폴더('{downloadFolder}')를 생성하거나 접근할 수 없습니다: {dirEx.Message}";
-                item.Status = TransferStatus.Error;
-                item.LastErrorCode = P2PErrorCode.DiskAccessError;
-                item.LastErrorMessage = errMsg;
-                RaiseError(P2PErrorCode.DiskAccessError, item.ChId, item.MsgId, item.PeerId, item.PeerName, errMsg, dirEx);
-                RaiseProgress(item, 64 * 1024, TransferStatus.Error, errMsg, null, P2PErrorCode.DiskAccessError);
-                return;
-            }
-
             CancellationToken ct = item.Cts.Token;
             string partFilePath = null;
             int chunkSize = 64 * 1024;
@@ -702,18 +685,49 @@ namespace P2PTransferLib
                     }
                     chunkSize = fileMeta.ChunkSize > 0 ? fileMeta.ChunkSize : 64 * 1024;
 
-                    // 다운로드 폴더에 같은 이름의 파일이 이미 존재하면 "(1)", "(2)"...를 붙인 파일명 결정 (단, 이어받기용 .part가 있으면 해당 .part 유지)
-                    string targetFileName = ResolveTargetFileName(downloadFolder, fileMeta.FileName, item.TaskKey);
-                    item.FileName = targetFileName;
+                    // savePathOrFolder에 파일명까지 포함된 경로(예: C:\Downloads\test.bin)를 넘겼더라도
+                    // 파일 이름으로 폴더를 만들지 않고 상위 폴더(C:\Downloads)와 파일명(test.bin)으로 정확히 분리합니다.
+                    SplitDirectoryAndFileName(savePathOrFolder, fileMeta.FileName, out string targetDir, out string desiredFileName);
 
-                    string finalFilePath = Path.Combine(downloadFolder, targetFileName);
+                    try
+                    {
+                        if (!Directory.Exists(targetDir))
+                        {
+                            Directory.CreateDirectory(targetDir);
+                        }
+                    }
+                    catch (Exception dirEx)
+                    {
+                        string errMsg = $"저장 폴더('{targetDir}')를 생성하거나 접근할 수 없습니다: {dirEx.Message}";
+                        item.Status = TransferStatus.Error;
+                        item.LastErrorCode = P2PErrorCode.DiskAccessError;
+                        item.LastErrorMessage = errMsg;
+                        RaiseError(P2PErrorCode.DiskAccessError, item.ChId, item.MsgId, item.PeerId, item.PeerName, errMsg, dirEx);
+                        RaiseProgress(item, chunkSize, TransferStatus.Error, errMsg, null, P2PErrorCode.DiskAccessError);
+                        return;
+                    }
+
+                    // 만약 이전에 파일 이름으로 잘못 생성된 하위 폴더가 존재한다면 정리
+                    string accidentalDirPath = Path.Combine(targetDir, desiredFileName);
+                    if (Directory.Exists(accidentalDirPath))
+                    {
+                        try { Directory.Delete(accidentalDirPath, true); } catch { }
+                    }
+
+                    // 같은 이름의 파일이 이미 존재하면 "(1)", "(2)"...를 붙인 파일명 결정 (단, 이어받기용 .part가 있으면 해당 .part 유지)
+                    string targetFileName = ResolveTargetFileName(targetDir, desiredFileName, item.TaskKey);
+                    item.FileName = targetFileName;
+                    item.DownloadFolder = targetDir;
+
+                    // 하위 폴더 생성 없이 바로 "targetDir\파일이름.part"로 저장하다가 완료 시 "targetDir\파일이름"으로 변경
+                    string finalFilePath = Path.Combine(targetDir, targetFileName);
                     partFilePath = finalFilePath + ".part";
                     item.PartFilePath = partFilePath;
                     item.SavedFilePath = finalFilePath;
                     item.IsMissingNotified = false;
 
                     // 기존에 받다가 중지된 파일(.part)이 있는지 및 몇 퍼센트 받았었는지 확인
-                    var partialInfo = CheckPartialFileProgress(downloadFolder, targetFileName, item.FileSize, chunkSize);
+                    var partialInfo = CheckPartialFileProgress(targetDir, targetFileName, item.FileSize, chunkSize);
                     int startChunk = partialInfo.HasPartialFile ? partialInfo.SavedChunkCount : 0;
                     item.CurrentChunkIndex = startChunk;
 
@@ -723,10 +737,10 @@ namespace P2PTransferLib
                     }
                     else
                     {
-                        string renameNote = !string.Equals(targetFileName, fileMeta.FileName, StringComparison.OrdinalIgnoreCase)
-                            ? $" (동일 파일 존재로 이름 변경: '{fileMeta.FileName}' -> '{targetFileName}')"
+                        string renameNote = !string.Equals(targetFileName, desiredFileName, StringComparison.OrdinalIgnoreCase)
+                            ? $" (동일 파일 존재로 이름 변경: '{desiredFileName}' -> '{targetFileName}')"
                             : "";
-                        Log($"[파일 확인] chID:'{item.ChId}', msgID:'{item.MsgId}' -> 저장파일명:'{targetFileName}'{renameNote}, 크기:{P2PSenderNode.FormatBytes(item.FileSize)}, 총 {item.TotalChunks}패킷 (유효시간:{item.RemainingValidTimeText})");
+                        Log($"[파일 확인] chID:'{item.ChId}', msgID:'{item.MsgId}' -> 저장경로:'{finalFilePath}'{renameNote}, 크기:{P2PSenderNode.FormatBytes(item.FileSize)}, 총 {item.TotalChunks}패킷 (유효시간:{item.RemainingValidTimeText})");
                     }
 
                     // 3. 대기열(WaitQueue) 또는 시작 승인(QueueReady) 수신 대기
@@ -853,8 +867,8 @@ namespace P2PTransferLib
 
                     if (File.Exists(finalFilePath))
                     {
-                        string uniqueName = GetUniqueAvailableFileName(downloadFolder, fileMeta.FileName);
-                        finalFilePath = Path.Combine(downloadFolder, uniqueName);
+                        string uniqueName = GetUniqueAvailableFileName(targetDir, desiredFileName);
+                        finalFilePath = Path.Combine(targetDir, uniqueName);
                         item.FileName = uniqueName;
                     }
 
@@ -929,6 +943,43 @@ namespace P2PTransferLib
             finally
             {
                 item.WriteLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// 사용자가 입력한 경로(savePathOrFolder)가 파일명이 포함된 전체 경로(예: C:\Downloads\a.bin)인지
+        /// 폴더 경로(예: C:\Downloads)인지 판별하여, 절대 파일 이름으로 폴더를 만들지 않고
+        /// 실제 상위 폴더(targetDir)와 저장할 파일명(fileName)으로 분리합니다.
+        /// </summary>
+        private static void SplitDirectoryAndFileName(string savePathOrFolder, string serverFileName, out string targetDir, out string fileName)
+        {
+            string cleanPath = P2PFileWatchManager.NormalizePath(savePathOrFolder);
+            if (string.IsNullOrWhiteSpace(cleanPath))
+            {
+                targetDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Downloads");
+                fileName = serverFileName;
+                return;
+            }
+
+            string lastSegment = Path.GetFileName(cleanPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            bool looksLikeFilePath =
+                (!string.IsNullOrEmpty(serverFileName) && string.Equals(lastSegment, serverFileName, StringComparison.OrdinalIgnoreCase)) ||
+                File.Exists(cleanPath) ||
+                File.Exists(cleanPath + ".part") ||
+                (!string.IsNullOrEmpty(Path.GetExtension(lastSegment)));
+
+            if (looksLikeFilePath)
+            {
+                string parentDir = Path.GetDirectoryName(cleanPath);
+                targetDir = string.IsNullOrWhiteSpace(parentDir)
+                    ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Downloads")
+                    : parentDir;
+                fileName = !string.IsNullOrWhiteSpace(lastSegment) ? lastSegment : serverFileName;
+            }
+            else
+            {
+                targetDir = cleanPath;
+                fileName = serverFileName;
             }
         }
 
