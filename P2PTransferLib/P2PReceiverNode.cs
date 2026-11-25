@@ -125,8 +125,9 @@ namespace P2PTransferLib
         /// </summary>
         public int ConnectTimeoutMs { get; set; } = 5000;
 
-        // 여러 개의 수신 작업(Receiver)을 자동으로 관리하는 스레드 안전 컬렉션 (Key: "{peerId}_{chId}_{msgId}")
+        // 여러 개의 수신 작업(Receiver)을 자동으로 관리하는 스레드 안전 컬렉션 (Key: "{peerId}_{chId}_{msgId}_{folder}")
         private readonly ConcurrentDictionary<string, P2PReceiverItem> _receiverMap = new ConcurrentDictionary<string, P2PReceiverItem>();
+        private readonly object _fileNameResolveLock = new object();
 
         /// <summary>
         /// 단순 로그 출력 이벤트
@@ -409,7 +410,7 @@ namespace P2PTransferLib
             string normFolder = P2PFileWatchManager.NormalizePath(downloadFolder);
             string taskKey = $"{peerId.Trim()}_{chId.Trim()}_{msgId.Trim()}_{normFolder}";
 
-            // 이미 리스트에 동일한 (peerId, chId, msgId, downloadFolder) 아이템이 존재하는지 중복 체크
+            // 이미 리스트에 동일한 (peerId, chId, msgId, downloadFolder) 아이템이 현재 수신 진행 중인지 중복 체크
             if (_receiverMap.TryGetValue(taskKey, out var existing))
             {
                 existing.RefreshStatus();
@@ -424,14 +425,10 @@ namespace P2PTransferLib
                 }
                 else if (existing.Status == TransferStatus.WaitingQueue || existing.Status == TransferStatus.Transferring || existing.Status == TransferStatus.Merging)
                 {
-                    Log($"[중복 수신 무시] 이미 동일한 항목(chID:'{chId}', msgID:'{msgId}', 폴더:'{normFolder}')이 수신 진행 중입니다.");
+                    Log($"[중복 수신 무시] 이미 동일한 항목(chID:'{chId}', msgID:'{msgId}', 폴더:'{normFolder}')이 현재 수신 진행 중입니다.");
                     return Task.FromResult(existing);
                 }
-                else if (existing.Status == TransferStatus.Completed && !string.IsNullOrEmpty(existing.SavedFilePath) && File.Exists(existing.SavedFilePath))
-                {
-                    Log($"[중복 수신 무시] 이미 동일한 항목(chID:'{chId}', msgID:'{msgId}', 경로:'{existing.SavedFilePath}')이 수신 완료되어 파일이 존재합니다.");
-                    return Task.FromResult(existing);
-                }
+                // 만약 이전에 이미 완료(Completed)된 상태라면, 다시 수신 요청 시 기존 파일 뒤에 (1), (2)를 붙여서 새로 받을 수 있도록 진행 허용
             }
 
             // 새 Receiver 아이템 생성 후 관리 리스트(_receiverMap)에 자동 등록
@@ -697,7 +694,6 @@ namespace P2PTransferLib
                     var fileMeta = FrameStreamHelper.DeserializeJson<HandshakeResponse>(ackFrame.GetPayloadText());
                     if (fileMeta == null) return;
 
-                    item.FileName = fileMeta.FileName;
                     item.FileSize = fileMeta.FileSize;
                     item.TotalChunks = fileMeta.TotalChunks;
                     if (fileMeta.ExpireUtcTicks > 0)
@@ -706,25 +702,31 @@ namespace P2PTransferLib
                     }
                     chunkSize = fileMeta.ChunkSize > 0 ? fileMeta.ChunkSize : 64 * 1024;
 
-                    // 원래 파일명 그대로 저장하기 위한 경로 설정 (다운로드 중에는 "원래파일명.part" 사용)
-                    string finalFilePath = Path.Combine(downloadFolder, item.FileName);
+                    // 다운로드 폴더에 같은 이름의 파일이 이미 존재하면 "(1)", "(2)"...를 붙인 파일명 결정 (단, 이어받기용 .part가 있으면 해당 .part 유지)
+                    string targetFileName = ResolveTargetFileName(downloadFolder, fileMeta.FileName, item.TaskKey);
+                    item.FileName = targetFileName;
+
+                    string finalFilePath = Path.Combine(downloadFolder, targetFileName);
                     partFilePath = finalFilePath + ".part";
                     item.PartFilePath = partFilePath;
                     item.SavedFilePath = finalFilePath;
                     item.IsMissingNotified = false;
 
                     // 기존에 받다가 중지된 파일(.part)이 있는지 및 몇 퍼센트 받았었는지 확인
-                    var partialInfo = CheckPartialFileProgress(downloadFolder, item.FileName, item.FileSize, chunkSize);
+                    var partialInfo = CheckPartialFileProgress(downloadFolder, targetFileName, item.FileSize, chunkSize);
                     int startChunk = partialInfo.HasPartialFile ? partialInfo.SavedChunkCount : 0;
                     item.CurrentChunkIndex = startChunk;
 
                     if (partialInfo.HasPartialFile && startChunk > 0)
                     {
-                        Log($"[이어받기 감지] '{item.FileName}' 기존에 받다 중지된 파일이 있습니다! (기존 수신률: {partialInfo.SavedPercentage:0.0}%, {startChunk}/{item.TotalChunks} 패킷 완료 -> {startChunk + 1}번째 패킷부터 이어받기)");
+                        Log($"[이어받기 감지] '{targetFileName}' 기존에 받다 중지된 파일이 있습니다! (기존 수신률: {partialInfo.SavedPercentage:0.0}%, {startChunk}/{item.TotalChunks} 패킷 완료 -> {startChunk + 1}번째 패킷부터 이어받기)");
                     }
                     else
                     {
-                        Log($"[파일 확인] chID:'{item.ChId}', msgID:'{item.MsgId}' -> 파일명:'{item.FileName}', 크기:{P2PSenderNode.FormatBytes(item.FileSize)}, 총 {item.TotalChunks}패킷 (유효시간:{item.RemainingValidTimeText})");
+                        string renameNote = !string.Equals(targetFileName, fileMeta.FileName, StringComparison.OrdinalIgnoreCase)
+                            ? $" (동일 파일 존재로 이름 변경: '{fileMeta.FileName}' -> '{targetFileName}')"
+                            : "";
+                        Log($"[파일 확인] chID:'{item.ChId}', msgID:'{item.MsgId}' -> 저장파일명:'{targetFileName}'{renameNote}, 크기:{P2PSenderNode.FormatBytes(item.FileSize)}, 총 {item.TotalChunks}패킷 (유효시간:{item.RemainingValidTimeText})");
                     }
 
                     // 3. 대기열(WaitQueue) 또는 시작 승인(QueueReady) 수신 대기
@@ -845,13 +847,15 @@ namespace P2PTransferLib
                         }
                     }
 
-                    // 5. 파일 병합(Merge) 완료: "원래파일명.part" -> "원래파일명" 그대로 변경
+                    // 5. 파일 병합(Merge) 완료: ".part" -> 최종 파일명(이미 같은 이름이 생겼다면 (1), (2) 추가 확인)으로 변경
                     item.Status = TransferStatus.Merging;
                     RaiseProgress(item, chunkSize, TransferStatus.Merging, "파일 병합 중...", null);
 
                     if (File.Exists(finalFilePath))
                     {
-                        try { File.Delete(finalFilePath); } catch { }
+                        string uniqueName = GetUniqueAvailableFileName(downloadFolder, fileMeta.FileName);
+                        finalFilePath = Path.Combine(downloadFolder, uniqueName);
+                        item.FileName = uniqueName;
                     }
 
                     File.Move(partFilePath, finalFilePath);
@@ -862,7 +866,7 @@ namespace P2PTransferLib
                     // 송신자에게 완료(FileCompleted) 통보
                     await SendControlAsync(item, P2PCommand.FileCompleted, item.TotalChunks).ConfigureAwait(false);
 
-                    Log($"[수신 완료] 사번:{item.PeerId}({item.PeerName}) | chID:'{item.ChId}' | msgID:'{item.MsgId}' -> 원래 파일명 그대로 저장 완료: {finalFilePath}");
+                    Log($"[수신 완료] 사번:{item.PeerId}({item.PeerName}) | chID:'{item.ChId}' | msgID:'{item.MsgId}' -> 저장 완료: {finalFilePath}");
                     RaiseProgress(item, chunkSize, TransferStatus.Completed, "수신 완료", finalFilePath);
                 }
                 catch (OperationCanceledException)
@@ -925,6 +929,76 @@ namespace P2PTransferLib
             finally
             {
                 item.WriteLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// 다운로드 폴더에 같은 이름의 파일이 이미 있으면 "파일명 (1).확장자", "파일명 (2).확장자"를 붙여서 반환합니다.
+        /// 단, 이전에 받다가 중지된 ".part" 파일이 있고 현재 다른 활성 세션이 쓰고 있지 않다면 이어받기를 위해 해당 파일명을 그대로 반환합니다.
+        /// </summary>
+        private string ResolveTargetFileName(string downloadFolder, string originalFileName, string currentTaskKey)
+        {
+            lock (_fileNameResolveLock)
+            {
+                string baseName = Path.GetFileNameWithoutExtension(originalFileName);
+                string ext = Path.GetExtension(originalFileName);
+
+                int index = 0;
+                while (true)
+                {
+                    string candidateName = index == 0 ? originalFileName : $"{baseName} ({index}){ext}";
+                    string candidateFinalPath = Path.Combine(downloadFolder, candidateName);
+                    string candidatePartPath = candidateFinalPath + ".part";
+
+                    // 다른 활성 수신 작업이 현재 이 파일명(또는 .part)을 사용 중인지 확인
+                    bool usedByOtherActiveTask = _receiverMap.Values.Any(x =>
+                        x.TaskKey != currentTaskKey &&
+                        (x.Status == TransferStatus.WaitingQueue || x.Status == TransferStatus.Transferring || x.Status == TransferStatus.Paused || x.Status == TransferStatus.Merging) &&
+                        string.Equals(x.SavedFilePath, candidateFinalPath, StringComparison.OrdinalIgnoreCase));
+
+                    if (usedByOtherActiveTask)
+                    {
+                        index++;
+                        continue;
+                    }
+
+                    // 1) 이전에 받다가 중지된 .part 파일이 존재하면 이어받기를 위해 이 이름을 선택
+                    if (File.Exists(candidatePartPath))
+                    {
+                        return candidateName;
+                    }
+
+                    // 2) 완성된 파일이 이미 존재하면 덮어쓰지 않고 (1), (2)... 다음 번호로 넘어감
+                    if (File.Exists(candidateFinalPath))
+                    {
+                        index++;
+                        continue;
+                    }
+
+                    // 3) 사용 가능하고 충돌 없는 파일명 확정
+                    return candidateName;
+                }
+            }
+        }
+
+        private string GetUniqueAvailableFileName(string downloadFolder, string originalFileName)
+        {
+            lock (_fileNameResolveLock)
+            {
+                string baseName = Path.GetFileNameWithoutExtension(originalFileName);
+                string ext = Path.GetExtension(originalFileName);
+
+                int index = 0;
+                while (true)
+                {
+                    string candidateName = index == 0 ? originalFileName : $"{baseName} ({index}){ext}";
+                    string candidateFinalPath = Path.Combine(downloadFolder, candidateName);
+                    if (!File.Exists(candidateFinalPath))
+                    {
+                        return candidateName;
+                    }
+                    index++;
+                }
             }
         }
 
