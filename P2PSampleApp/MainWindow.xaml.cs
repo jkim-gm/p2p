@@ -35,13 +35,10 @@ namespace P2PSampleApp
 
             _sender.OnProgress += (s, e) =>
             {
-                if (e.Status != TransferStatus.Transferring)
+                Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    Dispatcher.BeginInvoke(new Action(() =>
-                    {
-                        AppendSenderLog($"   -> [OnProgress] 상태={e.Status} | 수신자={e.PeerName}({e.PeerId}) | chID={e.ChId}, msgID={e.MsgId} | 진행률={e.ProgressPercentage:0.0}% ({e.CurrentChunkIndex}/{e.TotalChunks}) | 남은유효시간={e.RemainingValidTime:mm\\:ss} | {e.Message}");
-                    }));
-                }
+                    AppendSenderLog($"   -> [OnProgress] 상태={e.Status} | 수신자={e.PeerName}({e.PeerId}) | chID={e.ChId}, msgID={e.MsgId} | 진행률={e.ProgressPercentage:0.0}% ({e.CurrentChunkIndex}/{e.TotalChunks}) | 남은유효시간={e.RemainingValidTime:mm\\:ss} | {e.Message}");
+                }));
             };
 
             // 수신자(클라이언트) 로그 및 OnProgress 이벤트 연결
@@ -52,18 +49,15 @@ namespace P2PSampleApp
 
             _receiverManager.OnProgress += (s, e) =>
             {
-                if (e.Status != TransferStatus.Transferring)
+                Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    Dispatcher.BeginInvoke(new Action(() =>
-                    {
-                        AppendReceiverLog($"   -> [OnProgress] 상태={e.Status} | 사번={e.PeerId}({e.PeerName}) | chID={e.ChId}, msgID={e.MsgId} | 진행률={e.ProgressPercentage:0.0}% ({e.CurrentChunkIndex}/{e.TotalChunks}) | 남은유효시간={e.RemainingValidTime:mm\\:ss} | {e.Message}");
-                    }));
+                    AppendReceiverLog($"   -> [OnProgress] 상태={e.Status} | 사번={e.PeerId}({e.PeerName}) | chID={e.ChId}, msgID={e.MsgId} | 진행률={e.ProgressPercentage:0.0}% ({e.CurrentChunkIndex}/{e.TotalChunks}) | 남은유효시간={e.RemainingValidTime:mm\\:ss} | {e.Message}");
+                }));
 
-                    // 수신 완료 시 독립된 Watch 클래스(P2PFileWatchManager)에 해당 파일을 등록하여 삭제 여부 감시
-                    if (e.Status == TransferStatus.Completed && !string.IsNullOrEmpty(e.SavedFilePath))
-                    {
-                        _fileWatcher.RegisterWatch(e.ChId, e.MsgId, e.SavedFilePath, "Receiver");
-                    }
+                // 수신 완료 시 독립된 Watch 클래스(P2PFileWatchManager)에 해당 파일을 등록하여 삭제 여부 감시
+                if (e.Status == TransferStatus.Completed && !string.IsNullOrEmpty(e.SavedFilePath))
+                {
+                    _fileWatcher.RegisterWatch(e.ChId, e.MsgId, e.SavedFilePath, "Receiver");
                 }
             };
 

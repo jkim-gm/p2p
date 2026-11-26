@@ -761,6 +761,7 @@ namespace P2PTransferLib
                         {
                             item.Status = TransferStatus.Transferring;
                             Log($"[수신 시작] 사번:{item.PeerId}({item.PeerName}), chID:'{item.ChId}', msgID:'{item.MsgId}' ({item.FileName}) 패킷 요청을 시작합니다. (시작 진행률:{item.ProgressPercentage:0.0}%)");
+                            RaiseProgress(item, chunkSize, TransferStatus.Transferring, $"수신 시작 ({startChunk}/{item.TotalChunks})", null);
                             break;
                         }
                         else if (qFrame.Command == P2PCommand.Cancel)
@@ -788,9 +789,17 @@ namespace P2PTransferLib
                         {
                             ct.ThrowIfCancellationRequested();
 
-                            while (item.IsPaused && !ct.IsCancellationRequested && !item.IsCancelled)
+                            if (item.IsPaused)
                             {
-                                await Task.Delay(100, ct).ConfigureAwait(false);
+                                item.Status = TransferStatus.Paused;
+                                while (item.IsPaused && !ct.IsCancellationRequested && !item.IsCancelled)
+                                {
+                                    await Task.Delay(100, ct).ConfigureAwait(false);
+                                }
+                                if (!item.IsPaused && !item.IsCancelled && !ct.IsCancellationRequested)
+                                {
+                                    item.Status = TransferStatus.Transferring;
+                                }
                             }
 
                             if (item.IsCancelled)
@@ -844,6 +853,14 @@ namespace P2PTransferLib
 
                             int doneCount = chunkIdx + 1;
                             item.CurrentChunkIndex = doneCount;
+
+                            // 패킷을 기다리는 도중에 일시정지(IsPaused)가 눌렸다면 Transferring으로 덮어쓰지 않고 Paused 상태를 유지!
+                            if (item.IsPaused)
+                            {
+                                item.Status = TransferStatus.Paused;
+                                continue;
+                            }
+
                             item.Status = TransferStatus.Transferring;
 
                             // 0.5초(500ms, ProgressIntervalMs) 간격 또는 첫 패킷 / 마지막 패킷일 때만 이벤트 및 로그 업데이트

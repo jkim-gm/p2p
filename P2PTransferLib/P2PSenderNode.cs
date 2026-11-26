@@ -690,6 +690,13 @@ namespace P2PTransferLib
                                         session.LastChunkIndex = doneCount;
                                         double pct = fileItem.TotalChunks > 0 ? (doneCount * 100.0 / fileItem.TotalChunks) : 100.0;
 
+                                        // 속도 제한 대기 도중에 Pause 명령이 들어온 경우 Transferring으로 덮어쓰지 않고 Paused 유지
+                                        if (session.IsPaused)
+                                        {
+                                            RaiseProgress(sessionKey, fileItem, peerId, peerName, doneCount, TransferStatus.Paused, "일시정지됨", false);
+                                            break;
+                                        }
+
                                         // 0.5초(500ms, ProgressIntervalMs) 간격 또는 첫 패킷 / 마지막 패킷일 때만 이벤트 및 로그 업데이트
                                         long nowTicks = DateTime.UtcNow.Ticks;
                                         double elapsedMs = (nowTicks - session.LastProgressTick) / (double)TimeSpan.TicksPerMillisecond;
