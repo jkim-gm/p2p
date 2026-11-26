@@ -94,6 +94,7 @@ namespace P2PTransferLib
             }
         }
 
+        internal TcpClient Client { get; set; }
         internal NetworkStream Stream { get; set; }
         internal SemaphoreSlim WriteLock { get; } = new SemaphoreSlim(1, 1);
         internal CancellationTokenSource Cts { get; set; }
@@ -322,7 +323,7 @@ namespace P2PTransferLib
             }
 
             // 먼저 현재 메모리 리스트(_receiverMap)에 등록된 항목이 있고 파일명을 이미 알고 있다면 즉시 로컬 확인
-            string taskKey = $"{peerId.Trim()}_{chId.Trim()}_{msgId.Trim()}";
+            string taskKey = $"{chId.Trim()}_{msgId.Trim()}";
             if (_receiverMap.TryGetValue(taskKey, out var existingItem) && !string.IsNullOrEmpty(existingItem.FileName) && existingItem.FileSize > 0)
             {
                 var localRes = CheckPartialFileProgress(downloadFolder, existingItem.FileName, existingItem.FileSize);
@@ -410,30 +411,53 @@ namespace P2PTransferLib
             }
 
             string normFolder = P2PFileWatchManager.NormalizePath(downloadFolder);
-            string taskKey = $"{peerId.Trim()}_{chId.Trim()}_{msgId.Trim()}_{normFolder}";
+            // 동일한 (chId, msgId)에 대해 중복 스레드가 절대 2개 뜨지 않도록 taskKey를 chId_msgId로 일원화
+            string taskKey = $"{chId.Trim()}_{msgId.Trim()}";
 
-            // 이미 리스트에 동일한 (peerId, chId, msgId, downloadFolder) 아이템이 현재 수신 진행 중인지 중복 체크
+            // 이미 리스트에 동일한 (chId, msgId) 아이템이 존재하는지 체크
             if (_receiverMap.TryGetValue(taskKey, out var existing))
             {
                 existing.RefreshStatus();
 
-                if (existing.IsPaused && existing.Stream != null)
+                // 1) 일시정지(Paused) 상태에서 '수신 시작'을 다시 누른 경우 -> 새 스레드를 띄우지 않고 기존 50% 스레드를 그대로 깨움!
+                if (existing.IsPaused || existing.Status == TransferStatus.Paused)
                 {
-                    existing.IsPaused = false;
-                    existing.Status = TransferStatus.Transferring;
-                    _ = SendControlAsync(existing, P2PCommand.Resume, existing.CurrentChunkIndex);
-                    Log($"[수신 재개] 사번:{peerId}({peerName}), chID:'{chId}', msgID:'{msgId}' 일시정지 해제 -> 이어받기 재개");
+                    if (existing.Stream != null && existing.Client != null && existing.Client.Connected)
+                    {
+                        existing.IsPaused = false;
+                        existing.Status = TransferStatus.Transferring;
+                        _ = SendControlAsync(existing, P2PCommand.Resume, existing.CurrentChunkIndex);
+                        Log($"[수신 재개] 사번:{peerId}({peerName}), chID:'{chId}', msgID:'{msgId}' 일시정지 해제 -> {existing.ProgressPercentage:0.0}% ({existing.CurrentChunkIndex}/{existing.TotalChunks} 패킷)부터 이어받기 재개");
+                        RaiseProgress(existing, 64 * 1024, TransferStatus.Transferring, "전송 재개됨", null);
+                        return Task.FromResult(existing);
+                    }
+                }
+
+                // 2) 현재 대기열/전송중/병합중인 경우 -> 중복 스레드 생성 차단
+                if (existing.Status == TransferStatus.WaitingQueue || existing.Status == TransferStatus.Transferring || existing.Status == TransferStatus.Merging)
+                {
+                    Log($"[중복 수신 무시] 이미 동일한 항목(chID:'{chId}', msgID:'{msgId}')이 현재 수신 진행 중입니다. ({existing.ProgressPercentage:0.0}%)");
                     return Task.FromResult(existing);
                 }
-                else if (existing.Status == TransferStatus.WaitingQueue || existing.Status == TransferStatus.Transferring || existing.Status == TransferStatus.Merging)
-                {
-                    Log($"[중복 수신 무시] 이미 동일한 항목(chID:'{chId}', msgID:'{msgId}', 폴더:'{normFolder}')이 현재 수신 진행 중입니다.");
-                    return Task.FromResult(existing);
-                }
-                // 만약 이전에 이미 완료(Completed)된 상태라면, 다시 수신 요청 시 기존 파일 뒤에 (1), (2)를 붙여서 새로 받을 수 있도록 진행 허용
+
+                // 3) 만약 이전 세션이 오류/끊김/소켓닫힘 상태여서 새로 연결해야 하는 경우 -> 기존 스레드를 확실히 종료하여 좀비 스레드 방지!
+                try { existing.Cts?.Cancel(); } catch { }
+                try { existing.Client?.Close(); } catch { }
             }
 
-            // 새 Receiver 아이템 생성 후 관리 리스트(_receiverMap)에 자동 등록
+            // 새 Receiver 아이템 생성 후 관리 리스트(_receiverMap)에 등록
+            // (만약 이전에 받다 중단된 existing의 미완성 .part 파일이 있다면 (1)을 붙이지 않고 그 파일을 그대로 이어받도록 경로 승계)
+            string inheritedSavedPath = null;
+            string inheritedPartPath = null;
+            string inheritedFileName = null;
+            if (existing != null && existing.Status != TransferStatus.Completed && existing.Status != TransferStatus.Cancelled &&
+                !string.IsNullOrEmpty(existing.PartFilePath) && File.Exists(existing.PartFilePath))
+            {
+                inheritedSavedPath = existing.SavedFilePath;
+                inheritedPartPath = existing.PartFilePath;
+                inheritedFileName = existing.FileName;
+            }
+
             var newItem = new P2PReceiverItem
             {
                 TaskKey = taskKey,
@@ -444,6 +468,9 @@ namespace P2PTransferLib
                 ChId = chId.Trim(),
                 MsgId = msgId.Trim(),
                 DownloadFolder = normFolder,
+                FileName = inheritedFileName,
+                SavedFilePath = inheritedSavedPath,
+                PartFilePath = inheritedPartPath,
                 Status = TransferStatus.WaitingQueue,
                 StartedTime = DateTime.Now,
                 ExpireTimeUtc = DateTime.UtcNow.AddMinutes(30),
@@ -451,7 +478,7 @@ namespace P2PTransferLib
             };
 
             _receiverMap[taskKey] = newItem;
-            Log($"[수신 목록 등록] 사번:{newItem.PeerId}({newItem.PeerName}), chID:'{newItem.ChId}', msgID:'{newItem.MsgId}' 리스트 추가됨 (총 관리 목록:{_receiverMap.Count}개)");
+            Log($"[수신 목록 등록] 사번:{newItem.PeerId}({newItem.PeerName}), chID:'{newItem.ChId}', msgID:'{newItem.MsgId}' (총 관리 목록:{_receiverMap.Count}개)");
 
             // 백그라운드 스레드에서 비동기 다운로드 시작 (UI 블로킹 없음)
             _ = Task.Run(() => RunDownloadSessionAsync(newItem, newItem.DownloadFolder));
@@ -613,6 +640,7 @@ namespace P2PTransferLib
 
             using (var client = new TcpClient())
             {
+                item.Client = client;
                 client.NoDelay = true;
                 try
                 {
@@ -714,8 +742,18 @@ namespace P2PTransferLib
                         try { Directory.Delete(accidentalDirPath, true); } catch { }
                     }
 
-                    // 같은 이름의 파일이 이미 존재하면 "(1)", "(2)"...를 붙인 파일명 결정 (단, 이어받기용 .part가 있으면 해당 .part 유지)
-                    string targetFileName = ResolveTargetFileName(targetDir, desiredFileName, item.TaskKey);
+                    // 이전에 받다 중단된 세션에서 승계된 .part 파일이 있으면 새 이름((1))을 만들지 않고 그 파일을 그대로 이어받음
+                    string targetFileName;
+                    if (!string.IsNullOrEmpty(item.PartFilePath) && File.Exists(item.PartFilePath) && !string.IsNullOrEmpty(item.FileName))
+                    {
+                        targetFileName = item.FileName;
+                    }
+                    else
+                    {
+                        // 같은 이름의 완성된 파일이 이미 존재하면 "(1)", "(2)"...를 붙인 파일명 결정 (단, 이어받기용 .part가 있으면 해당 .part 유지)
+                        targetFileName = ResolveTargetFileName(targetDir, desiredFileName, item.TaskKey);
+                    }
+
                     item.FileName = targetFileName;
                     item.DownloadFolder = targetDir;
 
@@ -944,6 +982,7 @@ namespace P2PTransferLib
                 finally
                 {
                     item.Stream = null;
+                    item.Client = null;
                 }
             }
         }
